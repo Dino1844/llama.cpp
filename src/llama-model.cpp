@@ -1368,6 +1368,7 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    llama_file_identity source_file_identity = {};
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -2016,6 +2017,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+    if (ml.files.size() == 1) {
+        pimpl->source_file_identity = ml.files.front()->identity();
+    }
 
     // create the backend buffers
     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
@@ -2165,6 +2169,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (ml.files.size() == 1 && pimpl->source_file_identity != ml.files.front()->identity()) {
+        pimpl->source_file_identity = {};
+    }
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -2561,6 +2568,10 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+llama_file_identity llama_model::source_file_identity() const {
+    return pimpl->source_file_identity;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

@@ -961,6 +961,105 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
     return ggml_nbytes(t);
 }
 
+static size_t ggml_hexagon_expert_cache_slot_size(ggml_type type, int64_t ne0, int64_t ne1) {
+    const size_t rows = hex_round_up(ne1, 32);
+    const size_t row_size = htp_tiled_row_size(type, hex_round_up(ne0, 32));
+    return row_size <= SIZE_MAX / rows ? rows * row_size : 0;
+}
+
+extern "C" {
+GGML_BACKEND_API size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1);
+}
+
+size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || ne0 < 32 || ne0 > UINT32_MAX - 31 || ne0 % 32 != 0 ||
+            ne1 <= 0 || ne1 > UINT32_MAX - 31 || ((dst == nullptr) != (src == nullptr))) {
+        return 0;
+    }
+    const auto quant = (ggml_type) type;
+    if (!htp_is_tiled_weight_type(quant) || !ggml_is_quantized(quant) || ne0 % ggml_blck_size(quant) != 0) {
+        return 0;
+    }
+    const size_t size = ggml_hexagon_expert_cache_slot_size(quant, ne0, ne1);
+    const size_t raw_row = ggml_row_size(quant, ne0);
+    if (size == 0 || raw_row > SIZE_MAX / (size_t) ne1) {
+        return 0;
+    }
+    if (dst) {
+        ggml_tensor expert = {};
+        expert.type  = quant;
+        expert.ne[0] = ne0;
+        expert.ne[1] = ne1;
+        expert.ne[2] = expert.ne[3] = 1;
+        expert.nb[0] = ggml_type_size(quant);
+        expert.nb[1] = raw_row;
+        expert.nb[2] = expert.nb[3] = raw_row * ne1;
+        expert.data  = dst;
+        htp_repack_tensor_tiled(&expert, src, expert.nb[2]);
+    }
+    return size;
+}
+
+static bool ggml_backend_hexagon_can_cache_moe_expert(const ggml_tensor * expert) {
+    return opt_rt_repack != 0 && expert && expert->ne[2] > 0 && expert->ne[2] <= UINT32_MAX && expert->ne[3] == 1 &&
+        ggml_backend_hexagon_pack_moe_expert(nullptr, nullptr, expert->type, expert->ne[0], expert->ne[1]) != 0 &&
+        ggml_is_contiguous(expert);
+}
+
+static bool ggml_backend_hexagon_prepare_expert_cache(ggml_tensor * bank) {
+    if (!bank || !bank->buffer || bank->buffer->buft->iface.alloc_buffer != ggml_backend_hexagon_buffer_type_alloc_buffer ||
+            bank->ne[0] <= 0 || bank->ne[0] > UINT32_MAX - 31 ||
+            bank->ne[1] <= 0 || bank->ne[1] > UINT32_MAX - 31 || bank->ne[2] <= 0 || bank->ne[2] > UINT32_MAX ||
+            !ggml_op_is_empty(bank->op) || !ggml_is_quantized(bank->type) || !ggml_hexagon_tensor_can_tile(bank)) {
+        return false;
+    }
+
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
+    if (!slot_size || (uint64_t) bank->ne[2] > SIZE_MAX / slot_size) {
+        return false;
+    }
+    if (bank->buffer->size != 0) {
+        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(bank->buffer);
+        const uintptr_t data = (uintptr_t) bank->data;
+        if (data < base || data - base > bank->buffer->size ||
+                (size_t) bank->ne[2] * slot_size > bank->buffer->size - (data - base)) {
+            return false;
+        }
+    }
+
+    ggml_hexagon_tensor_set_flags(bank, HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED);
+    return true;
+}
+
+static void ggml_backend_hexagon_upload_expert_cache(ggml_tensor * bank, const void * raw, size_t first_slot, size_t count) {
+    GGML_ASSERT(bank && bank->data && bank->buffer && ggml_hexagon_tensor_is_tiled(bank));
+    GGML_ASSERT(first_slot <= (size_t) bank->ne[2] && count <= (size_t) bank->ne[2] - first_slot);
+    if (count == 0) {
+        return;
+    }
+    GGML_ASSERT(raw && bank->nb[2] <= SIZE_MAX / count);
+
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(bank->buffer->context);
+    sbuf->sess->flush_sync();
+
+    // The bank keeps GGUF strides on the host, while each physical slot is tiled.
+    ggml_tensor part = *bank;
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
+    part.data = (uint8_t *) bank->data + first_slot * slot_size;
+    part.ne[2] = count;
+    part.nb[3] = count * bank->nb[2];
+    htp_repack_tensor_tiled(&part, raw, part.nb[3]);
+}
+
+static void ggml_backend_hexagon_upload_packed_expert_cache(ggml_tensor * bank, const void * packed, size_t slot) {
+    GGML_ASSERT(bank && bank->data && bank->buffer && ggml_hexagon_tensor_is_tiled(bank));
+    GGML_ASSERT(packed && slot < (size_t) bank->ne[2]);
+
+    // The caller synchronizes the backend once before filling the cache misses.
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
+    memcpy((uint8_t *) bank->data + slot * slot_size, packed, slot_size);
+}
+
 static size_t parse_size(const char * str, size_t default_unit = 1024 * 1024) {
     if (!str || str[0] == '\0') {
         return 0;
@@ -3384,6 +3483,21 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *) ggml_backend_hexagon_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
+        return (void *) ggml_backend_hexagon_pack_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_can_cache_moe_expert") == 0) {
+        return (void *) ggml_backend_hexagon_can_cache_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_prepare_expert_cache") == 0) {
+        return (void *) ggml_backend_hexagon_prepare_expert_cache;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_upload_expert_cache") == 0) {
+        return (void *) ggml_backend_hexagon_upload_expert_cache;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_upload_packed_expert_cache") == 0) {
+        return (void *) ggml_backend_hexagon_upload_packed_expert_cache;
     }
     return NULL;
 }

@@ -52,6 +52,7 @@ MANAGED_ENV_NAMES = (
     "GGML_OPENCL_ADRENO_XMEM_GEMM",
     "GGML_OPENCL_ADRENO_USE_LARGE_BUFFER",
     "GGML_SCHED_DEBUG",
+    "LLAMA_MOE_CACHE_PACKED_DIR",
     "MTMD_BACKEND_DEVICE",
     "D",
     "DEVICE",
@@ -201,6 +202,7 @@ def main():
     parser.add_argument("--sched-debug", action="store_true", help="Enable GGML/llama.cpp scheduler debug output (GGML_SCHED_DEBUG=2)")
     parser.add_argument("--mtmd-device", help="Specify the backend device ID for Multi-Threaded Multi-Device setup (MTMD_BACKEND_DEVICE)")
     parser.add_argument("--no-embd-offload", action="store_true", help="Keep token embeddings and output projection on CPU (-ot token_embd.weight=CPU,output.weight=CPU)")
+    parser.add_argument("--moe-cache-packed-dir", help="Packed Hexagon MoE experts directory on the execution target (LLAMA_MOE_CACHE_PACKED_DIR)")
 
     # Hexagon specific parameters
     parser.add_argument("--hex-verbose", help="Enable verbose logging (GGML_HEXAGON_VERBOSE)")
@@ -387,6 +389,7 @@ def main():
     set_env("GGML_HEXAGON_LIBHTP_DIR", args.hex_libhtp_dir)
     set_env("GGML_HEXAGON_OPTRACE", args.hex_optrace)
     set_env("MTMD_BACKEND_DEVICE", args.mtmd_device)
+    set_env("LLAMA_MOE_CACHE_PACKED_DIR", args.moe_cache_packed_dir)
 
     # OpenCL environment variables
     set_env("GGML_OPENCL_PLATFORM", args.cl_platform)
@@ -515,7 +518,7 @@ def main():
         if target_type == "linux":
             env_parts.insert(0, f"HOME={args.home_dir or '/home'}")
         for k, v in env_vars.items():
-            env_parts.append(f"{k}={v}")
+            env_parts.append(f"{k}={shlex.quote(v)}")
         env_str = " ".join(env_parts)
 
         cmd_str = shlex_join(cmd_args)
@@ -535,7 +538,7 @@ def main():
         # Linux remote run via SSH
         env_parts = library_env_parts("./lib")
         for k, v in env_vars.items():
-            env_parts.append(f"{k}={v}")
+            env_parts.append(f"{k}={shlex.quote(v)}")
         env_str = " ".join(env_parts)
 
         cmd_str = shlex_join(cmd_args)

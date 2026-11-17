@@ -671,6 +671,18 @@ int llama_file::file_id() const {
 #endif
 }
 
+llama_file_identity llama_file::identity() const {
+#if defined(__linux__)
+    struct stat st = {};
+    if (fstat(file_id(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        return { (uint64_t) st.st_dev, (uint64_t) st.st_ino, (uint64_t) st.st_size,
+            (uint64_t) st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec,
+            (uint64_t) st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec };
+    }
+#endif
+    return {};
+}
+
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }

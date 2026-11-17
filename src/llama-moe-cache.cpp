@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
+#include "llama-moe-packed.h"
 
 #include "ggml-cpp.h"
 
@@ -323,6 +324,11 @@ struct llama_moe_cache::impl {
     struct device {
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
+        bool (*prepare_bank)(ggml_tensor *) = nullptr;
+        void (*upload_slots)(ggml_tensor *, const void *, size_t, size_t) = nullptr;
+        bool (*can_cache)(const ggml_tensor *) = nullptr;
+        size_t (*pack_expert)(void *, const void *, int, int64_t, int64_t) = nullptr;
+        void (*upload_packed)(ggml_tensor *, const void *, size_t) = nullptr;
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
 
@@ -351,6 +357,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+        bool use_packed = false;
     };
 
     struct binding {
@@ -373,6 +380,15 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+    struct packed_profile {
+        llama_moe_packed_timing workers;
+        size_t records = 0;
+        int64_t wait_us = 0;
+        int64_t upload_us = 0;
+    };
+    packed_profile packed_single;
+    packed_profile packed_multi;
+    bool profile_packed = false;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -383,13 +399,15 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
     std::vector<moe_cache_lru::fill> cpu;
+    std::unique_ptr<llama_moe_packed> packed;
+    std::vector<int32_t> packed_ids;
 
     float    cpu_share = 0.0f;
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
 
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
-    FILE * trace = nullptr;
+    std::unique_ptr<FILE, void (*)(FILE *)> trace { nullptr, [](FILE * file) { fclose(file); } };
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -407,6 +425,24 @@ struct llama_moe_cache::impl {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                if (auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend))) {
+                    auto prepare = reinterpret_cast<decltype(d.prepare_bank)>(
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_prepare_expert_cache"));
+                    auto upload = reinterpret_cast<decltype(d.upload_slots)>(
+                            ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_upload_expert_cache"));
+                    if (prepare && upload) {
+                        d.prepare_bank = prepare;
+                        d.upload_slots = upload;
+                        d.can_cache = reinterpret_cast<decltype(d.can_cache)>(
+                                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_can_cache_moe_expert"));
+                        d.pack_expert = reinterpret_cast<decltype(d.pack_expert)>(
+                                ggml_backend_reg_get_proc_address(reg, "ggml_backend_pack_moe_expert"));
+                        if (d.pack_expert) {
+                            d.upload_packed = reinterpret_cast<decltype(d.upload_packed)>(
+                                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_upload_packed_expert_cache"));
+                        }
+                    }
+                }
             }
         }
         if (devices.empty()) {
@@ -429,6 +465,9 @@ struct llama_moe_cache::impl {
             if (it_dev == devices.end()) {
                 continue;
             }
+            if (it_dev->can_cache && !std::all_of(experts.begin(), experts.end(), it_dev->can_cache)) {
+                continue;
+            }
             const int32_t id = (int32_t) (it_dev - devices.begin());
             auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && llama_moe_cache_same_layout(g.ref, experts); });
             if (it == groups.end()) {
@@ -444,7 +483,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (groups.empty()) {
-            LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
+            LLAMA_LOG_WARN("%s: no layer has cacheable experts in host memory, MoE cache is disabled\n", __func__);
             return;
         }
 
@@ -452,10 +491,24 @@ struct llama_moe_cache::impl {
         // one extra slot at the end, CUDA MMQ can read past the last expert
         n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
-            const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+            const device & d = devices[g.id];
+            const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + n_zero + 1), alignment);
+                const int64_t n = n_slots + n_zero + 1;
+                size_t bytes = t->nb[2]*n;
+                if (d.upload_slots) {
+                    ggml_tensor bank = {};
+                    bank.type  = t->type;
+                    bank.ne[0] = t->ne[0];
+                    bank.ne[1] = t->ne[1];
+                    bank.ne[2] = n;
+                    bank.ne[3] = 1;
+                    std::copy(t->nb, t->nb + 3, bank.nb);
+                    bank.nb[3] = bytes;
+                    bytes = ggml_backend_buft_get_alloc_size(d.buft, &bank);
+                }
+                res += GGML_PAD(bytes, alignment);
             }
             return res;
         };
@@ -493,12 +546,14 @@ struct llama_moe_cache::impl {
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         cpu_share_q = (uint32_t) std::lround(cpu_share*65536.0f);
         if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
-            trace = fopen(path, "wb");
+            trace.reset(fopen(path, "wb"));
             if (trace == nullptr) {
                 throw std::runtime_error(std::string("failed to open the MoE cache trace ") + path);
             }
             write_trace_header(split_sum);
         }
+        const char * profile = getenv("LLAMA_MOE_CACHE_PROFILE");
+        profile_packed = trace || (profile && std::strcmp(profile, "1") == 0);
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
         for (group & g : groups) {
@@ -515,7 +570,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+            n_tensors[g.id] += g.ref.size()*(d.upload_slots ? 1 : 1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
         }
         if (n_tensors_host == 0) {
@@ -563,8 +618,11 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
-                    ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                    ggml_tensor * cached = bank;
+                    if (!devices[g.id].upload_slots) {
+                        cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                        ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                    }
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
@@ -582,6 +640,43 @@ struct llama_moe_cache::impl {
                 }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
+        }
+
+        if (const char * path = std::getenv("LLAMA_MOE_CACHE_PACKED_DIR"); !no_alloc && path && *path) {
+            size_t n_readers = 8;
+            if (const char * value = std::getenv("LLAMA_MOE_CACHE_IO_THREADS")) {
+                char * end = nullptr;
+                const long count = std::strtol(value, &end, 10);
+                if (end == value || *end != '\0' || count < 1 || count > 64) {
+                    throw std::runtime_error("LLAMA_MOE_CACHE_IO_THREADS must be an integer in [1, 64]");
+                }
+                n_readers = static_cast<size_t>(count);
+            }
+            packed = std::make_unique<llama_moe_packed>(path, model.source_file_identity(), n_readers);
+            size_t n_layers = 0;
+            for (const group & g : groups) {
+                const device & d = devices[g.id];
+                if (g.n_slots == 0 || !d.upload_packed) {
+                    continue;
+                }
+                for (int32_t il : g.layers) {
+                    std::vector<llama_moe_packed_tensor> tensors;
+                    for (const ggml_tensor * t : layers[il].experts) {
+                        const size_t size = d.pack_expert(nullptr, nullptr, t->type, t->ne[0], t->ne[1]);
+                        tensors.push_back({ t, size });
+                    }
+                    try {
+                        layers[il].use_packed = packed->add_layer(il, tensors);
+                    } catch (const std::exception & err) {
+                        LLAMA_LOG_WARN("%s: cannot use packed experts for layer %d, using GGUF weights: %s\n", __func__, il, err.what());
+                    }
+                    n_layers += layers[il].use_packed;
+                }
+            }
+            if (n_layers == 0) {
+                throw std::runtime_error("no layers can use the packed MoE cache");
+            }
+            LLAMA_LOG_INFO("%s: packed MoE cache: %zu layers, %zu parallel readers\n", __func__, n_layers, n_readers);
         }
 
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
@@ -617,6 +712,16 @@ struct llama_moe_cache::impl {
                 ggml_backend_buffer_set_usage(d.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             }
         }
+        for (const group & g : groups) {
+            const device & d = devices[g.id];
+            if (d.prepare_bank) {
+                for (ggml_tensor * bank : g.banks) {
+                    if (!d.prepare_bank(bank)) {
+                        throw std::runtime_error("Hexagon MoE cache cannot pack " + std::string(bank->name));
+                    }
+                }
+            }
+        }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
         for (size_t id = 0; id < devices.size(); ++id) {
@@ -641,15 +746,19 @@ struct llama_moe_cache::impl {
         return devices[groups[layers[il].ig].id].backend;
     }
 
-    // trace format, little endian: "MCT1", then u32 n_layer, n_expert_used, n_group
+    // trace format, little endian: "MCT1" or "MCT2", then u32 n_layer, n_expert_used, n_group
     // per group: u32 device, n_expert, n_layers, the layers (u32), f64 split, split_sum, u64 group host bytes, device host bytes, alignment,
-    //            u32 n_tensors, the bytes of one expert of each tensor (u64)
+    //            u32 n_tensors, the raw bytes of one expert of each tensor (u64)
+    // MCT2 adds the device storage bytes of one expert of each tensor (u64) to each group.
     // then one record per slot lookup: i32 layer, experts per token, n_ids, the ids (i32)
     void write_trace_header(double split_sum) {
-        auto u32 = [&](uint32_t v) { fwrite(&v, sizeof(v), 1, trace); };
-        auto u64 = [&](uint64_t v) { fwrite(&v, sizeof(v), 1, trace); };
-        auto f64 = [&](double   v) { fwrite(&v, sizeof(v), 1, trace); };
-        fwrite("MCT1", 1, 4, trace);
+        auto u32 = [&](uint32_t v) { fwrite(&v, sizeof(v), 1, trace.get()); };
+        auto u64 = [&](uint64_t v) { fwrite(&v, sizeof(v), 1, trace.get()); };
+        auto f64 = [&](double   v) { fwrite(&v, sizeof(v), 1, trace.get()); };
+        const bool tiled = std::any_of(groups.begin(), groups.end(), [&](const group & g) {
+            return devices[g.id].pack_expert != nullptr;
+        });
+        fwrite(tiled ? "MCT2" : "MCT1", 1, 4, trace.get());
         u32(layers.size());
         u32(n_expert_used);
         u32(groups.size());
@@ -670,20 +779,26 @@ struct llama_moe_cache::impl {
             for (const ggml_tensor * t : g.ref) {
                 u64(t->nb[2]);
             }
+            if (tiled) {
+                for (const ggml_tensor * t : g.ref) {
+                    size_t bytes = t->nb[2];
+                    if (d.pack_expert) {
+                        bytes = std::max(bytes, d.pack_expert(nullptr, nullptr, t->type, t->ne[0], t->ne[1]));
+                    }
+                    u64(bytes);
+                }
+            }
         }
     }
 
     void write_trace(int32_t il, int32_t n_used) {
         const int32_t rec[3] = { il, n_used, (int32_t) ids.size() };
-        fwrite(rec, sizeof(int32_t), 3, trace);
-        fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
+        fwrite(rec, sizeof(int32_t), 3, trace.get());
+        fwrite(ids.data(), sizeof(int32_t), ids.size(), trace.get());
     }
 
     ~impl() {
         log_stats();
-        if (trace != nullptr) {
-            fclose(trace);
-        }
     }
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
@@ -736,7 +851,8 @@ struct llama_moe_cache::impl {
         }
         const binding & b = it->second;
         const group & g = groups[layers[b.il].ig];
-        if (backend != devices[g.id].backend) {
+        // Tiled banks cannot be copied using raw GGUF byte offsets.
+        if (backend != devices[g.id].backend || devices[g.id].upload_slots) {
             return 0;
         }
 
@@ -832,21 +948,60 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // Fill the slots before publishing the slot map to the device.
+        const device & d = devices[g.id];
         size_t bytes = 0;
+        packed_profile * profile = nullptr;
+        llama_moe_packed_timing batch_timing;
+        int64_t read_start = 0;
+        if (l.use_packed && !fills.empty()) {
+            if (profile_packed) {
+                profile = sel->src[0]->ne[1] == 1 ? &packed_single : &packed_multi;
+                read_start = ggml_time_us();
+            }
+            packed_ids.clear();
+            for (const auto & f : fills) {
+                packed_ids.push_back(f.expert);
+            }
+            try {
+                bytes = packed->read(il, packed_ids, profile ? &batch_timing : nullptr);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_WARN("%s: packed experts disabled for layer %d, using GGUF weights: %s\n", __func__, il, err.what());
+                l.use_packed = false;
+                profile = nullptr;
+            }
+        }
+        const int64_t upload_start = profile ? ggml_time_us() : 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
+            if (l.use_packed) {
+                for (size_t i = 0; i < fills.size(); ++i) {
+                    d.upload_packed(bank, packed->data(i, ip), fills[i].slot);
+                }
+                continue;
+            }
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                const uint8_t * data = (const uint8_t *) w->data + fills[i].expert*expert_size;
+                if (d.upload_slots) {
+                    d.upload_slots(bank, data, fills[i].slot, n);
+                } else {
+                    ggml_backend_tensor_set_async(backend, bank, data, fills[i].slot*expert_size, n*expert_size);
+                }
                 bytes += n*expert_size;
                 i += n;
             }
+        }
+        if (profile) {
+            profile->workers.add(batch_timing);
+            profile->records += fills.size();
+            profile->wait_us += upload_start - read_start;
+            profile->upload_us += ggml_time_us() - upload_start;
         }
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
@@ -875,6 +1030,16 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        auto log_packed = [](const char * name, const packed_profile & p) {
+            if (p.records == 0) {
+                return;
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: packed timings %s: records=%zu pread_sum_ms=%.3f crc_sum_ms=%.3f crc_cpu_ms=%.3f pread_max_ms=%.3f crc_max_ms=%.3f wait_ms=%.3f upload_ms=%.3f\n",
+                    name, p.records, p.workers.pread_us/1000.0, p.workers.crc_us/1000.0, p.workers.crc_cpu_us/1000.0,
+                    p.workers.max_pread_us/1000.0, p.workers.max_crc_us/1000.0, p.wait_us/1000.0, p.upload_us/1000.0);
+        };
+        log_packed("single-token", packed_single);
+        log_packed("multi-token", packed_multi);
     }
 };
 

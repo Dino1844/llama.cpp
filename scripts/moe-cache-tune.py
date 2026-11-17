@@ -13,6 +13,7 @@ import re
 import shlex
 import signal
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -44,6 +45,7 @@ def pad(x, n):
 # routing trace (LLAMA_MOE_CACHE_TRACE)
 
 class Group:
+    device: int
     n_expert: int
     layers: list
     split: float
@@ -52,13 +54,22 @@ class Group:
     dev_host_bytes: int
     alignment: int
     nb2: list
+    storage_nb2: list[int] | None
     expert_bytes: int
+
+    def layout(self):
+        return self.device, self.n_expert, self.layers, self.alignment, self.nb2, self.storage_nb2
+
+    def alloc_bytes(self, n_slots, n_zero):
+        strides = self.storage_nb2 if self.storage_nb2 is not None else self.nb2
+        return sum(pad(stride * (n_slots + n_zero + 1), self.alignment) for stride in strides)
 
 
 def read_trace(path):
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"MCT1":
+    version = data[:4]
+    if version not in (b"MCT1", b"MCT2"):
         sys.exit(f"{path}: not a MoE cache trace")
     pos = 4
 
@@ -72,12 +83,13 @@ def read_trace(path):
     groups = []
     for _ in range(n_group):
         g = Group()
-        _, g.n_expert, n_layers = take("3I")
+        g.device, g.n_expert, n_layers = take("3I")
         g.layers = list(take(f"{n_layers}I"))
         g.split, g.split_sum = take("2d")
         g.host_bytes, g.dev_host_bytes, g.alignment = take("3Q")
         (n_tensors,) = take("I")
         g.nb2 = list(take(f"{n_tensors}Q"))
+        g.storage_nb2 = list(take(f"{n_tensors}Q")) if version == b"MCT2" else None
         g.expert_bytes = sum(g.nb2)
         groups.append(g)
 
@@ -93,6 +105,10 @@ def read_trace(path):
 def concat_traces(paths):
     traces = [read_trace(p) for p in paths]
     n_layer, n_expert_used, groups, _ = traces[0]
+    layout = [g.layout() for g in groups]
+    for path, (layers, experts_used, other_groups, _) in zip(paths[1:], traces[1:]):
+        if (layers, experts_used) != (n_layer, n_expert_used) or [g.layout() for g in other_groups] != layout:
+            sys.exit(f"{path}: incompatible MoE cache trace layout, rerun with one runtime and model")
     return n_layer, n_expert_used, groups, [rec for t in traces for rec in t[3]]
 
 
@@ -106,15 +122,12 @@ def trace_tokens(trace):
 def n_slots_of(g, size_mib, n_zero, n_expert_used):
     budget = int(float(size_mib * 1024 * 1024) * g.split / g.split_sum * float(g.host_bytes) / float(g.dev_host_bytes))
 
-    def alloc(n):
-        return sum(pad(nb2 * (n + n_zero + 1), g.alignment) for nb2 in g.nb2)
-
-    if alloc(0) > budget:
+    if g.alloc_bytes(0, n_zero) > budget:
         return 0
     lo, hi = 0, len(g.layers) * g.n_expert
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if alloc(mid) <= budget:
+        if g.alloc_bytes(mid, n_zero) <= budget:
             lo = mid
         else:
             hi = mid - 1
@@ -127,7 +140,7 @@ def full_mib(trace, share):
     n_zero = min(n_expert_used, 64) if f32(share) > 0.0 else 0
     res = 0.0
     for g in groups:
-        alloc = sum(pad(nb2 * (len(g.layers) * g.n_expert + n_zero + 1), g.alignment) for nb2 in g.nb2)
+        alloc = g.alloc_bytes(len(g.layers) * g.n_expert, n_zero)
         res = max(res, alloc / (g.split / g.split_sum * g.host_bytes / g.dev_host_bytes))
     return math.ceil(res / 2**20) + 1
 
@@ -394,6 +407,71 @@ def table(header, rows):
     return "\n".join("  " + "  ".join(" " * (wi - width(c)) + c for c, wi in zip(row, w)) for row in [header] + rows)
 
 
+def read_measured_samples(path, max_mib):
+    with open(path, encoding="utf-8") as f:
+        samples = json.load(f)
+    if not isinstance(samples, list):
+        raise TypeError("expected a JSON array of benchmark samples")
+
+    groups: dict[int, list[tuple[float, float | None]]] = {}
+    token_counts: set[int] = set()
+    for i, sample in enumerate(samples, 1):
+        if not isinstance(sample, dict):
+            raise TypeError(f"sample {i}: expected a JSON object")
+        mib, tokens, decode_ms = (sample.get(key) for key in ("mib", "tokens", "decode_ms"))
+        wait_ms = sample.get("wait_ms")
+        if type(mib) is not int or mib <= 0 or type(tokens) is not int or tokens <= 0:
+            raise ValueError(f"sample {i}: mib and tokens must be positive integers")
+        if type(decode_ms) not in (int, float) or not math.isfinite(decode_ms) or decode_ms <= 0:
+            raise ValueError(f"sample {i}: decode_ms must be finite and positive")
+        if wait_ms is not None and (type(wait_ms) not in (int, float) or not 0 <= wait_ms <= decode_ms):
+            raise ValueError(f"sample {i}: wait_ms must be between zero and decode_ms")
+        if mib <= max_mib:
+            rate = 1000.0 * tokens / decode_ms
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError(f"sample {i}: invalid decode rate")
+            groups.setdefault(mib, []).append((rate, wait_ms / tokens if wait_ms is not None else None))
+            token_counts.add(tokens)
+
+    if not groups:
+        raise ValueError(f"no samples within the {max_mib} MiB budget")
+    if len(token_counts) != 1:
+        raise ValueError("samples within the budget must use the same token count")
+    for mib, runs in groups.items():
+        if len(runs) < 3:
+            raise ValueError(f"{mib} MiB: need at least three measured runs")
+    return groups, token_counts.pop()
+
+
+def tune_measured(path, max_mib):
+    groups, tokens = read_measured_samples(path, max_mib)
+    rates = {mib: [rate for rate, _ in groups[mib]] for mib in sorted(groups)}
+    medians = {mib: statistics.median(values) for mib, values in rates.items()}
+    fastest = max(medians, key=lambda mib: medians[mib])
+    fastest_min = min(rates[fastest])
+    # Require separation across observed repeats before spending extra memory.
+    median_smaller = 0.0
+    pick = fastest
+    for mib, values in rates.items():
+        if medians[mib] >= median_smaller and max(values) >= fastest_min:
+            pick = mib
+            break
+        median_smaller = max(median_smaller, medians[mib])
+
+    rows = []
+    for mib, values in rates.items():
+        waits = [wait for _, wait in groups[mib] if wait is not None]
+        throughput = f"{medians[mib]:.2f}"
+        rows.append([mib, len(values), best(throughput) if mib == pick else throughput,
+                     f"{min(values):.2f} - {max(values):.2f}",
+                     f"{statistics.median(waits):.2f} ({len(waits)}/{len(values)})" if waits else "-"])
+
+    say(f"Measured decode, {tokens} tokens per run, cache budget {max_mib} MiB.")
+    say(table(["cache MiB", "runs", "median t/s", "observed t/s", "median wait ms/token (runs)"], rows))
+    say()
+    say(f"recommended: {code(f'--moe-cache-mib {pick}')} (measured range and median)")
+
+
 # model file
 
 GGUF_SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -574,6 +652,8 @@ def tune(cmd, out, max_mib):
 
     trace = concat_traces([os.path.join(out, f"run-{r['mib']}-{r['share']:g}.trace") for r in runs])
     groups = trace[2]
+    if any(g.storage_nb2 is not None for g in groups):
+        logger.warning("Tiled cache capacity uses device strides. Throughput estimates use raw GGUF bytes for replay and may be inaccurate with packed I/O.")
     gib = sum(g.expert_bytes * len(g.layers) for g in groups) / sum(len(g.layers) for g in groups) / 2**30
     for r in runs:
         r["up_gib"], r["cpu_gib"] = r["up_mib"] / 1024 / r["tokens"], r["cpu"] * gib / r["tokens"]
@@ -611,18 +691,28 @@ def tune(cmd, out, max_mib):
 
 def main():
     ap = argparse.ArgumentParser(description="picks --moe-cache-mib and --moe-cache-cpu-share for a llama-server command",
-                                 usage="%(prog)s [--max-mib N] [--out DIR] [--markdown] -- llama-server -m model.gguf -cmoe [args]")
+                                 usage="%(prog)s [--max-mib N] [--out DIR] [--markdown] -- llama-server -m model.gguf -cmoe [args]\n"
+                                       "       %(prog)s --samples FILE --max-mib N [--markdown]")
     ap.add_argument("--max-mib", type=int, help="largest cache in MiB (default: what fits)")
+    ap.add_argument("--samples", help="JSON file with repeated decode measurements")
     ap.add_argument("--out", default="moe-cache-tune", help="run directory, reused for the same command (default: moe-cache-tune)")
     ap.add_argument("--markdown", action="store_true", help="Markdown tables")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="llama-server command")
     args = ap.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+    FMT["markdown"] = args.markdown
+    FMT["tty"] = sys.stdout.isatty() and not args.markdown
+    if args.samples is not None:
+        if cmd or args.max_mib is None or args.max_mib <= 0:
+            ap.error("--samples requires a positive --max-mib and no server command")
+        try:
+            tune_measured(args.samples, args.max_mib)
+        except (OSError, TypeError, ValueError, OverflowError) as e:
+            ap.error(f"{args.samples}: {e}")
+        return
     if not cmd:
         ap.error("pass the llama-server command after --")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    FMT["markdown"] = args.markdown
-    FMT["tty"] = sys.stdout.isatty() and not args.markdown
     tune(cmd, args.out, args.max_mib)
 
 

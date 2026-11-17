@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -17,6 +18,9 @@ using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
+// Device, inode, size, mtime (ns), ctime (ns).
+using llama_file_identity = std::array<uint64_t, 5>;
+
 struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
@@ -26,6 +30,7 @@ struct llama_file {
     size_t size() const;
 
     int file_id() const; // fileno overload
+    llama_file_identity identity() const;
 
     void seek(size_t offset, int whence) const;
 

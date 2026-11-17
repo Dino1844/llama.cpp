@@ -338,7 +338,9 @@ static std::string get_driver_path() {
 using dl_handle_ptr = std::unique_ptr<dl_handle, dl_handle_deleter>;
 
 int htpdrv_init() {
+#ifndef __ANDROID__
     static dl_handle_ptr lib_cdsp_rpc_handle = nullptr;
+#endif
     static bool initialized = false;
 #ifdef _WIN32
     std::string drv_path = get_driver_path() + "\\" + "libcdsprpc.dll";
@@ -387,7 +389,12 @@ int htpdrv_init() {
     dlsym(handle.get(), remote_handle64_close_pfn_t, remote_handle64_close_pfn, remote_handle64_close, false);
     dlsym(handle.get(), remote_system_request_pfn_t, remote_system_request_pfn, remote_system_request, true);
 
+#ifdef __ANDROID__
+    // FastRPC teardown can call Binder after its static state is gone.
+    (void) handle.release();
+#else
     lib_cdsp_rpc_handle = std::move(handle);
+#endif
     initialized         = true;
 
     return AEE_SUCCESS;
