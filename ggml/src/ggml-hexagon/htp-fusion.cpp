@@ -320,7 +320,8 @@ static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & p
     if (x_in != x || ids_in != ids || w_in->type != w0->type ||
         w_in->ne[0] != w0->ne[0] || w_in->ne[2] != w0->ne[2] ||
         ggml_hexagon_tensor_is_tiled(w_in) != ggml_hexagon_tensor_is_tiled(w0) ||
-        orig_kparams->n_hmx != cur_kparams->n_hmx) {
+        orig_kparams->n_hmx != cur_kparams->n_hmx ||
+        (orig_kparams->n_hmx && ((ggml_hexagon_tensor_get_flags(w_in) ^ ggml_hexagon_tensor_get_flags(w0)) & HTP_TENSOR_Q3K_COMPACT))) {
         return false;
     }
 

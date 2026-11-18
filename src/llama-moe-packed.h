@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -29,10 +30,21 @@ public:
     llama_moe_packed(const char * directory, const llama_file_identity & source, size_t threads);
     ~llama_moe_packed();
 
-    bool add_layer(int32_t layer, const std::vector<llama_moe_packed_tensor> & tensors);
+    const char * layout() const;
+    bool add_layer(int32_t layer, const std::vector<llama_moe_packed_tensor> & tensors, bool compact_q3k);
     size_t read(int32_t layer, const std::vector<int32_t> & experts, llama_moe_packed_timing * timing = nullptr);
 
-    // Valid until the next read. Families use the order passed to add_layer.
+    using completion = std::function<void(size_t miss, const uint8_t * record, const std::vector<size_t> & family_offsets)>;
+
+    // One controlling thread must join each batch before starting another or destroying the reader.
+    // Keep experts unchanged and timing valid until join_async returns or throws.
+    // Worker callbacks may run concurrently and must not join the batch. Record data is valid only during the callback and is null on error.
+    void start_async(int32_t layer, const std::vector<int32_t> & experts, completion on_complete,
+                     llama_moe_packed_timing * timing = nullptr);
+    // Waits for all callbacks before returning the payload bytes or rethrowing a worker error.
+    size_t join_async();
+
+    // Valid until the next batch. Families use the order passed to add_layer.
     const uint8_t * data(size_t miss, size_t family) const;
 
 private:

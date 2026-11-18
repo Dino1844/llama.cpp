@@ -133,6 +133,7 @@ size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buf
 size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+bool   opt_moe_hmx_pipeline = false;
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
 int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
@@ -152,6 +153,7 @@ int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
 int    opt_oppoll    = 0;    // polling for batch completions
 int    opt_opfusion  = 1;    // enable/disable op fusion
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = all tileable weights (default)
+static bool opt_q3k_compact = false; // compact tiled Q3_K for routed expert cache banks
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -191,6 +193,7 @@ static void ggml_hexagon_dump_op_supp(const char * sess_name, const struct ggml_
 static const char * htp_event_name(uint16_t id) {
     switch (id) {
         case HTP_TRACE_EVT_DMA:            return "DMA";
+        case HTP_TRACE_EVT_DMA_WAIT:       return "DMA_WAIT";
         case HTP_TRACE_EVT_HVX_COMP:       return "HVX_COMP";
         case HTP_TRACE_EVT_HVX_A_QUANT:    return "HVX_A_QUANT";
         case HTP_TRACE_EVT_HVX_A_PREP:     return "HVX_A_PREP";
@@ -210,6 +213,7 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_HVX_GDN_STATE:  return "HVX_GDN_STATE";
         case HTP_TRACE_EVT_HVX_GDN_REM:    return "HVX_GDN_REM";
         case HTP_TRACE_EVT_HMX_COMP:       return "HMX_COMP";
+        case HTP_TRACE_EVT_HMX_WAIT:       return "HMX_WAIT";
         case HTP_TRACE_EVT_L2FLUSH:        return "L2FLUSH";
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
@@ -360,6 +364,36 @@ struct ggml_hexagon_session {
 
     uint8_t *                                         mdev_fence_slot = nullptr;
     std::unordered_map<uint64_t, volatile uint32_t *> cpy_fence_slots;
+
+    htp_opvec<const ggml_tensor *, HTP_OP_MAX_OUTPUTS> expert_ready_banks;
+    ggml_tensor                                       expert_ready_tensor {};
+    bool                                              caps_checked = false;
+    uint32_t                                          caps = 0;
+
+    bool has_capability(uint32_t cap) {
+        if (!caps_checked) {
+            uint32_t flags = 0;
+            if (htp_iface_capabilities(handle, &flags) == AEE_SUCCESS) {
+                caps = flags;
+            }
+            caps_checked = true;
+        }
+        return (caps & cap) != 0;
+    }
+
+    const ggml_tensor * expert_ready_for(const htp_opnode & node) const {
+        static_assert(HTP_OP_MAX_OUTPUTS + 2 < HTP_OP_MAX_INPUTS, "routed NX reserves its last input for expert readiness");
+        if (expert_ready_banks.empty() || (node.opcode != HTP_OP_MUL_MAT_ID && node.opcode != HTP_OP_MUL_MAT_ID_NX)) {
+            return nullptr;
+        }
+        const ggml_tensor * weight = node.inputs[0];
+        const ggml_tensor * base = weight->view_src ? weight->view_src : weight;
+        if (std::find(expert_ready_banks.begin(), expert_ready_banks.end(), base) == expert_ready_banks.end()) {
+            return nullptr;
+        }
+        GGML_ASSERT(weight->view_offs == 0 && weight->ne[2] <= base->ne[2]);
+        return &expert_ready_tensor;
+    }
 
     void enqueue_mdev_group();
     void enqueue_op(const htp_opnode & node);
@@ -675,7 +709,10 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     HEX_VERBOSE("ggml-hex: %s init-tensor %s : base %p data %p nbytes %zu\n", sess->c_name(),
                 tensor->name, (void *) sbuf->base(), tensor->data, ggml_nbytes(tensor));
 
-    tensor->extra = (void *) (uintptr_t) 0;
+    // Preserve the compact bank marker set before allocation.
+    if (tensor->extra != (void *) (uintptr_t) HTP_TENSOR_Q3K_COMPACT) {
+        tensor->extra = nullptr;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -949,29 +986,44 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_hexagon_tiled_row_size(ggml_type type, int64_t ne0, bool compact) {
+    if (compact) {
+        return htp_q3k_compact_slab_size(ne0) / 32;
+    }
+    return htp_tiled_row_size(type, hex_round_up(ne0, 32));
+}
+
+static bool ggml_hexagon_tensor_is_q3k_compact(const ggml_tensor * t) {
+    return opt_q3k_compact && t->type == GGML_TYPE_Q3_K && (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_Q3K_COMPACT);
+}
+
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
     if (opt_rt_repack != 0 && !ggml_backend_buft_is_host(buft) && ggml_op_is_empty(t->op) && htp_is_tiled_weight_tensor(t)) {
-        int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
         int64_t ne2 = t->ne[2];
         int64_t ne3 = t->ne[3];
-        size_t tiled_size = htp_tiled_row_size(t->type, ne0) * ne1 * ne2 * ne3;
+        size_t tiled_size = ggml_hexagon_tiled_row_size(t->type, t->ne[0], ggml_hexagon_tensor_is_q3k_compact(t)) * ne1 * ne2 * ne3;
         return std::max(tiled_size, ggml_nbytes(t));
     }
     return ggml_nbytes(t);
 }
 
-static size_t ggml_hexagon_expert_cache_slot_size(ggml_type type, int64_t ne0, int64_t ne1) {
+static size_t ggml_hexagon_expert_cache_slot_size(ggml_type type, int64_t ne0, int64_t ne1, bool compact) {
     const size_t rows = hex_round_up(ne1, 32);
-    const size_t row_size = htp_tiled_row_size(type, hex_round_up(ne0, 32));
+    const size_t row_size = ggml_hexagon_tiled_row_size(type, ne0, compact);
     return row_size <= SIZE_MAX / rows ? rows * row_size : 0;
+}
+
+static size_t ggml_hexagon_expert_cache_slot_size(const ggml_tensor * bank) {
+    return ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1], ggml_hexagon_tensor_is_q3k_compact(bank));
 }
 
 extern "C" {
 GGML_BACKEND_API size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1);
+GGML_BACKEND_API size_t ggml_backend_hexagon_pack_moe_expert_compact(void * dst, const void * src, int type, int64_t ne0, int64_t ne1);
 }
 
-size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+static size_t ggml_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1, bool compact) {
     if (type < 0 || type >= GGML_TYPE_COUNT || ne0 < 32 || ne0 > UINT32_MAX - 31 || ne0 % 32 != 0 ||
             ne1 <= 0 || ne1 > UINT32_MAX - 31 || ((dst == nullptr) != (src == nullptr))) {
         return 0;
@@ -980,12 +1032,16 @@ size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int ty
     if (!htp_is_tiled_weight_type(quant) || !ggml_is_quantized(quant) || ne0 % ggml_blck_size(quant) != 0) {
         return 0;
     }
-    const size_t size = ggml_hexagon_expert_cache_slot_size(quant, ne0, ne1);
+    const size_t size = ggml_hexagon_expert_cache_slot_size(quant, ne0, ne1, compact);
     const size_t raw_row = ggml_row_size(quant, ne0);
     if (size == 0 || raw_row > SIZE_MAX / (size_t) ne1) {
         return 0;
     }
     if (dst) {
+        if (compact) {
+            htp_repack_q3k_compact(dst, src, ne0, ne1);
+            return size;
+        }
         ggml_tensor expert = {};
         expert.type  = quant;
         expert.ne[0] = ne0;
@@ -1000,10 +1056,25 @@ size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int ty
     return size;
 }
 
+size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+    return ggml_hexagon_pack_moe_expert(dst, src, type, ne0, ne1, false);
+}
+
+size_t ggml_backend_hexagon_pack_moe_expert_compact(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+    return ggml_hexagon_pack_moe_expert(dst, src, type, ne0, ne1, type == GGML_TYPE_Q3_K);
+}
+
 static bool ggml_backend_hexagon_can_cache_moe_expert(const ggml_tensor * expert) {
     return opt_rt_repack != 0 && expert && expert->ne[2] > 0 && expert->ne[2] <= UINT32_MAX && expert->ne[3] == 1 &&
-        ggml_backend_hexagon_pack_moe_expert(nullptr, nullptr, expert->type, expert->ne[0], expert->ne[1]) != 0 &&
+        ggml_hexagon_pack_moe_expert(nullptr, nullptr, expert->type, expert->ne[0], expert->ne[1],
+            opt_q3k_compact && expert->type == GGML_TYPE_Q3_K) != 0 &&
         ggml_is_contiguous(expert);
+}
+
+static void ggml_backend_hexagon_mark_expert_cache(ggml_tensor * bank) {
+    if (bank->type == GGML_TYPE_Q3_K) {
+        ggml_hexagon_tensor_set_flags(bank, HTP_TENSOR_Q3K_COMPACT);
+    }
 }
 
 static bool ggml_backend_hexagon_prepare_expert_cache(ggml_tensor * bank) {
@@ -1014,9 +1085,25 @@ static bool ggml_backend_hexagon_prepare_expert_cache(ggml_tensor * bank) {
         return false;
     }
 
-    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank);
     if (!slot_size || (uint64_t) bank->ne[2] > SIZE_MAX / slot_size) {
         return false;
+    }
+    if (ggml_hexagon_tensor_is_q3k_compact(bank)) {
+        const size_t size = (size_t) bank->ne[2] * slot_size;
+        if (size > UINT32_MAX || ggml_backend_buffer_get_alloc_size(bank->buffer, bank) != size) {
+            return false;
+        }
+        if (bank->buffer->size != 0) {
+            auto * sess = static_cast<ggml_hexagon_shared_buffer *>(bank->buffer->context)->sess;
+            if (!sess->has_capability(HTP_CAP_Q3K_COMPACT) ||
+                    std::any_of(sess->mdev.sessions.begin(), sess->mdev.sessions.end(), [](const auto & peer) {
+                        return !peer->has_capability(HTP_CAP_Q3K_COMPACT);
+                    })) {
+                GGML_LOG_ERROR("ggml-hex: GGML_HEXAGON_Q3K_COMPACT requires DSP support for compact Q3_K\n");
+                return false;
+            }
+        }
     }
     if (bank->buffer->size != 0) {
         const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(bank->buffer);
@@ -1043,9 +1130,17 @@ static void ggml_backend_hexagon_upload_expert_cache(ggml_tensor * bank, const v
     sbuf->sess->flush_sync();
 
     // The bank keeps GGUF strides on the host, while each physical slot is tiled.
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank);
+    uint8_t * dst = (uint8_t *) bank->data + first_slot * slot_size;
+    if (ggml_hexagon_tensor_is_q3k_compact(bank)) {
+        const auto * experts = static_cast<const uint8_t *>(raw);
+        for (size_t i = 0; i < count; ++i) {
+            htp_repack_q3k_compact(dst + i * slot_size, experts + i * bank->nb[2], bank->ne[0], bank->ne[1]);
+        }
+        return;
+    }
     ggml_tensor part = *bank;
-    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
-    part.data = (uint8_t *) bank->data + first_slot * slot_size;
+    part.data = dst;
     part.ne[2] = count;
     part.nb[3] = count * bank->nb[2];
     htp_repack_tensor_tiled(&part, raw, part.nb[3]);
@@ -1056,7 +1151,7 @@ static void ggml_backend_hexagon_upload_packed_expert_cache(ggml_tensor * bank, 
     GGML_ASSERT(packed && slot < (size_t) bank->ne[2]);
 
     // The caller synchronizes the backend once before filling the cache misses.
-    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank->type, bank->ne[0], bank->ne[1]);
+    const size_t slot_size = ggml_hexagon_expert_cache_slot_size(bank);
     memcpy((uint8_t *) bank->data + slot * slot_size, packed, slot_size);
 }
 
@@ -1452,12 +1547,14 @@ struct ggml_hexagon_opbatch {
             } else {
                 h.nb[0] = t->nb[0];
             }
-            const int64_t ne0_padded = hex_round_up(t->ne[0], 32);
             const int64_t ne1_padded = hex_round_up(t->ne[1], 32);
-            h.nb[1] = htp_tiled_row_size(t->type, ne0_padded);
+            h.nb[1] = ggml_hexagon_tiled_row_size(t->type, t->ne[0], flags & HTP_TENSOR_Q3K_COMPACT);
             h.nb[2] = h.nb[1] * ne1_padded;
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
+            GGML_ASSERT(!(flags & HTP_TENSOR_Q3K_COMPACT) ||
+                    (t->type == GGML_TYPE_Q3_K && t->ne[3] == 1 &&
+                     h.size == ggml_backend_buffer_get_alloc_size(t->buffer, t)));
         } else {
             h.nb[0] = t->nb[0];
             h.nb[1] = t->nb[1];
@@ -1466,7 +1563,7 @@ struct ggml_hexagon_opbatch {
             h.size  = ggml_nbytes(t);
         }
 
-        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE);
+        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_Q3K_COMPACT);
     }
 
     static uint64_t hash_tensor(const ggml_tensor * t, const htp_tensor & shape) {
@@ -1527,13 +1624,13 @@ struct ggml_hexagon_opbatch {
         return ti;
     }
 
-    bool fit_tensors(const htp_opnode & node) const {
+    bool fit_tensors(const htp_opnode & node, const ggml_tensor * expert_ready) const {
         // check how much extras we will need
         size_t extra_bufs = 0;
         size_t extra_vmem = 0;
         size_t extra_tens = 0;
 
-        const bool check_tens = (n_tens + node.inputs.size() + node.outputs.size()) > n_tens_max;
+        const bool check_tens = (n_tens + node.inputs.size() + node.outputs.size() + (expert_ready != nullptr)) > n_tens_max;
 
         int seen_bufs[HTP_OP_MAX_BUFS];
         int n_seen_bufs = 0;
@@ -1570,6 +1667,7 @@ struct ggml_hexagon_opbatch {
         for (const auto * output : node.get_outputs()) {
             fit_tensor(output);
         }
+        fit_tensor(expert_ready);
 
         if ((extra_bufs + n_bufs) > n_bufs_max) return false;
         if (check_tens && (extra_tens + n_tens) > n_tens_max) return false;
@@ -1578,7 +1676,7 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
-    void sync_op_desc(unsigned int n) {
+    void sync_op_desc(unsigned int n, const ggml_tensor * expert_ready) {
         const htp_opnode & node = ops[n];
         htp_op_desc & o = h_ops[n];
 
@@ -1590,6 +1688,10 @@ struct ggml_hexagon_opbatch {
         for (unsigned int i = 0; i < HTP_OP_MAX_INPUTS; i++) {
             o.src[i] = (i < inputs.size() && inputs[i]) ? add_tensor(inputs[i]) : 0xffff;
         }
+        if (expert_ready) {
+            GGML_ASSERT(inputs.size() < HTP_OP_MAX_INPUTS);
+            o.src[HTP_OP_MAX_INPUTS - 1] = add_tensor(expert_ready);
+        }
 
         const auto & outputs = node.get_outputs();
         for (unsigned int i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
@@ -1598,7 +1700,7 @@ struct ggml_hexagon_opbatch {
     }
 
     // caller must ensure the op fits
-    void add_op(const htp_opnode & node) {
+    void add_op(const htp_opnode & node, const ggml_tensor * expert_ready = nullptr) {
         unsigned int n = n_ops++;
         GGML_ASSERT(n_ops <= n_ops_max);
 
@@ -1606,7 +1708,7 @@ struct ggml_hexagon_opbatch {
         h_ops[n].flags = 0;
 
         ggml_hexagon_dump_op_exec(sess->c_name(), ops[n], h_ops[n].flags);
-        sync_op_desc(n);
+        sync_op_desc(n, expert_ready);
     }
 
     void sort_buffers() {
@@ -1651,17 +1753,23 @@ struct ggml_hexagon_opbatch {
         }
     }
 
-    bool try_fuse(const htp_opnode & node) {
+    bool try_fuse(const htp_opnode & node, const ggml_tensor * expert_ready) {
         if (n_ops == 0) {
             return false;
         }
 
         htp_opnode & last_node = ops[n_ops - 1];
+        // The table is attached to the wire descriptor, keeping the logical inputs available for fusion.
+        const bool last_has_ready = (last_node.opcode == HTP_OP_MUL_MAT_ID || last_node.opcode == HTP_OP_MUL_MAT_ID_NX) &&
+            h_ops[n_ops - 1].src[HTP_OP_MAX_INPUTS - 1] != 0xffff;
+        if (last_has_ready != (expert_ready != nullptr)) {
+            return false;
+        }
         if (!htp_fusion_try_fuse(sess, last_node, node)) {
             return false;
         }
 
-        sync_op_desc(n_ops - 1);
+        sync_op_desc(n_ops - 1, expert_ready);
         HEX_VERBOSE("ggml-hex: %s fused %s (N=%zu, #%u)\n",
                     sess->c_name(), last_node.name().c_str(), last_node.fused.size() + 1, n_ops - 1);
         return true;
@@ -1993,9 +2101,11 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     for (const auto * dst : node.get_outputs()) {
         register_tensor(dst);
     }
+    const ggml_tensor * expert_ready = expert_ready_for(node);
+    register_tensor(expert_ready);
 
-    const bool fits_tensors = op_batch->fit_tensors(node);
-    if (opt_opfusion && fits_tensors && op_batch->try_fuse(node)) {
+    const bool fits_tensors = op_batch->fit_tensors(node, expert_ready);
+    if (opt_opfusion && fits_tensors && op_batch->try_fuse(node, expert_ready)) {
         return;
     }
 
@@ -2005,12 +2115,12 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
 
     if (op_batch->empty()) {
         start_batch();
-        if (!op_batch->fit_tensors(node)) {
+        if (!op_batch->fit_tensors(node, expert_ready)) {
             GGML_ABORT("ggml-hex: %s op does not fit into empty batch (vmem/tensor/buffer limit exceeded)\n", c_name());
         }
     }
 
-    op_batch->add_op(node);
+    op_batch->add_op(node, expert_ready);
 }
 
 void ggml_hexagon_session::enqueue_mdev_group() {
@@ -3470,6 +3580,66 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static uint32_t * ggml_backend_hexagon_set_expert_ready(
+        ggml_backend_t backend, ggml_tensor * const * banks, size_t n_banks, size_t n_slots) {
+    if (!ggml_backend_is_hexagon(backend)) {
+        return nullptr;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (!banks) {
+        sess->expert_ready_banks.clear();
+        return nullptr;
+    }
+
+    // Reserve at most half of the session's fence pool for the reusable slot state table.
+    constexpr size_t states_per_fence_slot = HTP_FENCE_SLOT_SIZE / sizeof(uint32_t);
+    if (!sess->fence_buf || !sess->op_batch) {
+        return nullptr;
+    }
+    const uint32_t reserved = sess->fence_buf->slot_count / 2;
+    if (sess->mdev.count != 1 || n_banks == 0 || n_banks > HTP_OP_MAX_OUTPUTS ||
+            n_slots == 0 || n_slots > reserved * states_per_fence_slot ||
+            !sess->expert_ready_banks.empty() || !sess->op_batch->empty() ||
+            sess->batch_req_seq != sess->batch_rsp_seq) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < n_banks; ++i) {
+        const ggml_tensor * bank = banks[i];
+        if (!bank || !bank->buffer || !bank->data || bank->view_src ||
+                bank->buffer->buft->iface.alloc_buffer != ggml_backend_hexagon_buffer_type_alloc_buffer ||
+                !ggml_hexagon_tensor_is_tiled(bank) || bank->ne[2] != (int64_t) n_slots) {
+            return nullptr;
+        }
+        const auto * sbuf = static_cast<const ggml_hexagon_shared_buffer *>(bank->buffer->context);
+        if (sbuf->sess != sess) {
+            return nullptr;
+        }
+    }
+
+    if (!sess->has_capability(HTP_CAP_EXPERT_READY)) {
+        return nullptr;
+    }
+
+    void * data = sess->expert_ready_tensor.data;
+    if (!data) {
+        data = sess->fence_buf->alloc_slot(reserved);
+        if (!data) {
+            return nullptr;
+        }
+    }
+    const uint32_t n_fence_slots = (n_slots + states_per_fence_slot - 1) / states_per_fence_slot;
+    sess->expert_ready_tensor = sess->make_fence_tensor(data, n_fence_slots);
+    ggml_tensor & table = sess->expert_ready_tensor;
+    table.type = GGML_TYPE_I32;
+    table.ne[0] = states_per_fence_slot;
+    table.nb[0] = sizeof(uint32_t);
+    ggml_set_name(&table, "expert_ready");
+    for (size_t i = 0; i < n_banks; ++i) {
+        sess->expert_ready_banks.push_back(banks[i]);
+    }
+    return static_cast<uint32_t *>(data);
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -3485,7 +3655,11 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
         return (void *) ggml_backend_hexagon_comm_allreduce_tensor;
     }
     if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
-        return (void *) ggml_backend_hexagon_pack_moe_expert;
+        return opt_q3k_compact ?
+            (void *) ggml_backend_hexagon_pack_moe_expert_compact : (void *) ggml_backend_hexagon_pack_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_mark_expert_cache") == 0) {
+        return opt_q3k_compact ? (void *) ggml_backend_hexagon_mark_expert_cache : nullptr;
     }
     if (strcmp(name, "ggml_backend_hexagon_can_cache_moe_expert") == 0) {
         return (void *) ggml_backend_hexagon_can_cache_moe_expert;
@@ -3498,6 +3672,9 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_hexagon_upload_packed_expert_cache") == 0) {
         return (void *) ggml_backend_hexagon_upload_packed_expert_cache;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_set_expert_ready") == 0) {
+        return (void *) ggml_backend_hexagon_set_expert_ready;
     }
     return NULL;
 }
@@ -3650,6 +3827,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
+    const char * str_q3k_compact = getenv("GGML_HEXAGON_Q3K_COMPACT");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -3657,6 +3835,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_vtcm_size = getenv("GGML_HEXAGON_VTCM_SIZE");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_moe_hmx_pipeline = getenv("GGML_HEXAGON_MOE_HMX_PIPELINE");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
     const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
@@ -3711,6 +3890,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
+    opt_q3k_compact = str_q3k_compact && strcmp(str_q3k_compact, "1") == 0;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     if (str_power_mode) {
@@ -3725,6 +3905,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_vtcm_size = str_vtcm_size ? parse_size(str_vtcm_size)                 : opt_vtcm_size;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_moe_hmx_pipeline = str_moe_hmx_pipeline && std::strcmp(str_moe_hmx_pipeline, "1") == 0;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
     opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;

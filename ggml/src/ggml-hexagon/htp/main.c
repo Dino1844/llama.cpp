@@ -800,6 +800,12 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     return AEE_SUCCESS;
 }
 
+AEEResult htp_iface_capabilities(remote_handle64 handle, uint32_t * flags) {
+    (void) handle;
+    *flags = HTP_CAP_EXPERT_READY | HTP_CAP_Q3K_COMPACT;
+    return AEE_SUCCESS;
+}
+
 static void htp_error_callback(dspqueue_t queue, int error, void * context) {
     // No errors expected on the DSP.
     FARF(ERROR, "Error callback: 0x%08x", (unsigned) error);

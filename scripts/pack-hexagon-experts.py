@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 LAYOUT = "hexagon-tiled-v1"
+COMPACT_LAYOUT = "hexagon-q3k-compact-v1"
 INDEX = "index.json"
 MANIFEST = "manifest.json"
 TENSOR_NAME = re.compile(r"blk\.(\d+)\.ffn_(?:gate_up|gate|up|down)_exps\.weight")
@@ -141,17 +142,17 @@ def read_json(path):
     return json.loads(data)
 
 
-def read_pack_layout(directory):
+def read_pack_layout(directory, format_name=LAYOUT):
     # Only the file and tensor order are needed to compare bytes with the GGUF.
     if os.path.lexists(directory / INDEX):
         index = read_json(directory / INDEX)
-        if index["version"] != 1 or index["layout"] != LAYOUT:
+        if index["version"] != 1 or index["layout"] != format_name:
             raise ValueError("unsupported packed expert index")
         return index["layers"]
 
     manifest = read_json(directory / MANIFEST)
     if (manifest["schema_version"], manifest["layout"], manifest["backend_layout"]) != (
-            1, "layer_major_expert", LAYOUT):
+            1, "layer_major_expert", format_name):
         raise ValueError("unsupported packed expert manifest")
     by_layer = {}
     for entry in manifest["entries"]:
@@ -206,8 +207,8 @@ def verify_stamp(path, stamp, file=None):
         raise ValueError(f"file changed while packing or verifying: {path}")
 
 
-def process(source, model, source_stamp, directory, layers, pack, verify):
-    layout = read_pack_layout(directory) if verify else [
+def process(source, model, source_stamp, directory, layers, pack, verify, format_name=LAYOUT):
+    layout = read_pack_layout(directory, format_name) if verify else [
         {"layer": layer, "file": f"layer_{layer:03d}.bin", "tensors": sorted(tensors)}
         for layer, tensors in sorted(layers.items())
     ]
@@ -255,7 +256,7 @@ def process(source, model, source_stamp, directory, layers, pack, verify):
     for name, stamp in filenames.items():
         verify_stamp(directory / name, stamp)
 
-    sealed = {"version": 1, "layout": LAYOUT, "source": source_stamp, "layers": index}
+    sealed = {"version": 1, "layout": format_name, "source": source_stamp, "layers": index}
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=".index-", delete=False) as file:
         temporary = Path(file.name)
         try:
@@ -283,6 +284,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path, help="complete, single-file GGUF")
     parser.add_argument("--lib-dir", required=True, type=Path, help="directory with matching Hexagon libraries")
+    parser.add_argument("--q3k-compact", action="store_true", help="store Q3_K experts with compact scale metadata")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--out-dir", type=Path, help="new directory for packed experts")
     action.add_argument("--verify", type=Path, metavar="DIR", help="byte-compare and seal an existing pack against the GGUF")
@@ -293,20 +295,24 @@ def main():
     libc = C.CDLL(None, use_errno=True)
     base = C.CDLL(str(libs / "libggml-base.so"), mode=C.RTLD_GLOBAL)
     hexagon = C.CDLL(str(libs / "libggml-hexagon.so"))
-    pack = bind(hexagon, "ggml_backend_hexagon_pack_moe_expert", C.c_size_t,
+    pack_symbol = "ggml_backend_hexagon_pack_moe_expert"
+    format_name = COMPACT_LAYOUT if args.q3k_compact else LAYOUT
+    if args.q3k_compact:
+        pack_symbol += "_compact"
+    pack = bind(hexagon, pack_symbol, C.c_size_t,
                 C.c_void_p, C.c_void_p, C.c_int, C.c_int64, C.c_int64)
     with open_regular(model) as source:
         stamp = file_stamp(os.fstat(source.fileno()))
         layers = read_model(base, libc, source, stamp[2], pack)
         if args.verify:
             directory = args.verify.expanduser().resolve(strict=True)
-            process(source, model, stamp, directory, layers, pack, verify=True)
+            process(source, model, stamp, directory, layers, pack, verify=True, format_name=format_name)
         else:
             destination = args.out_dir.expanduser().absolute()
             if os.path.lexists(destination):
                 raise ValueError(f"output directory already exists: {destination}")
             with tempfile.TemporaryDirectory(dir=destination.parent, prefix=f".{destination.name}-") as stage:
-                process(source, model, stamp, Path(stage), layers, pack, verify=False)
+                process(source, model, stamp, Path(stage), layers, pack, verify=False, format_name=format_name)
                 publish(libc, Path(stage), destination)
 
 

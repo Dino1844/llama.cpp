@@ -615,9 +615,10 @@ static bool htp_matmul_is_hmx_eligible(
     bool is_matmul_id,
     bool is_batched
 ) {
-    GGML_UNUSED(dst);
-
-    if (src1->type != GGML_TYPE_F32 && (src1->type != GGML_TYPE_F16 || is_matmul_id)) {
+    const uint32_t compact_bank = HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_Q3K_COMPACT;
+    const bool compact = src0->type == GGML_TYPE_Q3_K && (ggml_hexagon_tensor_get_flags(src0) & compact_bank) == compact_bank;
+    if ((compact && (!is_matmul_id || !opt_moe_hmx_pipeline)) ||
+            (src1->type != GGML_TYPE_F32 && (src1->type != GGML_TYPE_F16 || is_matmul_id))) {
         return false;
     }
 
@@ -626,6 +627,12 @@ static bool htp_matmul_is_hmx_eligible(
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
+
+    if (compact && (ne00 % 256 != 0 || src1->view_offs % 128 != 0 || src1->nb[0] != sizeof(float) ||
+                    (ne11 > 1 && src1->nb[1] % 128 != 0) || src1->nb[2] % 128 != 0 ||
+                    (dst && dst->view_offs % 128 != 0))) {
+        return false;
+    }
 
     if (ne01 % HTP_TENSOR_TILE_N_ROWS != 0 && is_matmul_id) {
         return false;
@@ -730,7 +737,7 @@ static bool htp_kparams_solve_hmx_mm(
     }
 
     kparams->n_hmx              = 1;
-    kparams->pipeline           = pipeline ? 1 : 0;
+    kparams->pipeline           = pipeline || (is_matmul_id && opt_moe_hmx_pipeline);
     kparams->m_chunk            = m_chunk;
     kparams->n_chunk            = n_chunk;
     kparams->n_hvx              = n_hvx;

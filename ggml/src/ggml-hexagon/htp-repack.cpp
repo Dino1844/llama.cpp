@@ -1221,28 +1221,72 @@ static bool hexagon_recover_k_scales(const ggml_half * prod, int n, int lmin, in
     return false;
 }
 
+static inline void repack_q3_K_quant_tile(uint8_t * tile, const block_q3_K * b, int row, int kt_local) {
+    uint8_t * lo_pl  = tile;
+    uint8_t * neg_pl = tile + 256;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    repack_neon_q2_3_k_low2(b->qs, kt_local, lo_pl, row);
+    repack_neon_q3_k_hmask(b->hmask, kt_local, neg_pl, row);
+#else
+    for (int lk = 0; lk < 32; lk++) {
+        const int e   = kt_local * 32 + lk;
+        const int g   = lk >> 2;
+        const int pos = row * 4 + (lk & 3);
+        lo_pl[(g >> 2) * 128 + pos] |= (uint8_t) (q2_3_K_get_low2(b->qs, e) << ((g & 3) * 2));
+        if (!q3_K_get_hbit(b, e)) {
+            neg_pl[pos] |= (uint8_t) (1 << g);
+        }
+    }
+#endif
+}
+
+void htp_repack_q3k_compact(void * dst, const void * raw, int64_t ne0, int64_t ne1) {
+    GGML_ASSERT(ne0 > 0 && ne0 <= UINT32_MAX && ne0 % QK_K == 0 && ne1 > 0);
+    const size_t blocks_per_row = ne0 / QK_K;
+    const size_t slab_size = htp_q3k_compact_slab_size((uint32_t) ne0);
+    const uint64_t slab_count = ((uint64_t) ne1 + 31) / 32;
+    GGML_ASSERT(slab_size > 0 && slab_count <= SIZE_MAX / slab_size);
+
+    const auto * blocks = (const block_q3_K *) raw;
+    auto * slab = (uint8_t *) dst;
+    for (int64_t n = 0; n < ne1; n += 32, slab += slab_size) {
+        const int rows = (int) std::min<int64_t>(32, ne1 - n);
+        memset(slab, 0, slab_size);
+        for (size_t kb = 0; kb < blocks_per_row; kb++) {
+            uint8_t * group = slab + kb * HTP_Q3K_COMPACT_GROUP_BYTES;
+            uint8_t * multipliers = group + HTP_Q3K_COMPACT_QUANTS_BYTES;
+            uint8_t * scales = group + HTP_Q3K_COMPACT_SCALES_OFFSET;
+
+            for (int row = 0; row < rows; row++) {
+                const block_q3_K * b = blocks + ((size_t) n + row) * blocks_per_row + kb;
+                for (int kt = 0; kt < 8; kt++) {
+                    repack_q3_K_quant_tile(group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8), b, row, kt);
+                }
+                memcpy(multipliers + row * sizeof(b->d), &b->d, sizeof(b->d));
+                for (size_t i = 0; i < sizeof(b->scales); i++) {
+                    scales[i * 32 + row] = b->scales[i];
+                }
+            }
+
+            // A zero signed scale is encoded as 32. Together with a +0 multiplier,
+            // this makes the expanded padding match the tiled layout's +0 scales.
+            if (rows < 32) {
+                for (int i = 8; i < 12; i++) {
+                    memset(scales + i * 32 + rows, 0xAA, 32 - rows);
+                }
+            }
+        }
+    }
+}
+
 static void repack_q3_K_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
     repack_kquant_to_tiled_grid<block_q3_K>(t, data, offset, size, HTP_TENSOR_TILE_SIZE_Q3_K,
         [](uint8_t * tile, const block_q3_K * b, int row, int kt_local) {
             const float d     = GGML_FP16_TO_FP32(b->d);
-            uint8_t * lo_pl   = tile;
-            uint8_t * neg_pl  = tile + 256;
             ggml_half * sc_pl = (ggml_half *) (tile + 384);
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-            repack_neon_q2_3_k_low2(b->qs, kt_local, lo_pl, row);
-            repack_neon_q3_k_hmask(b->hmask, kt_local, neg_pl, row);
-#else
-            for (int lk = 0; lk < 32; lk++) {
-                const int e   = kt_local * 32 + lk;
-                const int g   = lk >> 2;
-                const int pos = row * 4 + (lk & 3);
-                lo_pl[(g >> 2) * 128 + pos] |= (uint8_t) (q2_3_K_get_low2(b->qs, e) << ((g & 3) * 2));
-                if (!q3_K_get_hbit(b, e)) {
-                    neg_pl[pos] |= (uint8_t) (1 << g);
-                }
-            }
-#endif
+            repack_q3_K_quant_tile(tile, b, row, kt_local);
             for (int sub = 0; sub < 2; sub++) {
                 sc_pl[sub * 32 + row] = GGML_FP32_TO_FP16(d * (float) q3_K_get_scale(b->scales, kt_local * 2 + sub));
             }

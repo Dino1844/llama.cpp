@@ -40,6 +40,10 @@ The paths refer to the execution target. Choose the cache size to fit the model 
 
 On a miss the reader uses one aligned read per expert and checks the record's CRC32 before uploading it. `LLAMA_MOE_CACHE_IO_THREADS` controls the parallel read limit (default 8, range 1-64). Measure sustained decode and prompt processing separately when choosing a value. The reader tries direct I/O first and uses buffered reads when the filesystem rejects direct I/O at open. An unavailable layer file, bad record or failed read switches that layer to the GGUF weights. Layers outside the pack also use the GGUF weights. A requested pack must have a matching index and at least one usable layer at startup. The CRC detects accidental corruption. Use a trusted index produced by the packer.
 
+`GGML_HEXAGON_Q3K_COMPACT=1` enables the compact layout for Q3_K expert banks. It requires matching DSP support. Add `--q3k-compact` when creating or verifying the packed directory for those banks. Other quantizations keep their existing layout.
+
+`GGML_HEXAGON_MOE_HMX_PIPELINE=1` enables the routed HMX pipeline when the tensor shape and VTCM budget permit it. `LLAMA_MOE_CACHE_READY=1` optionally lets eligible multi-row packed batches submit same-layer expert work while missing weights are read and verified. Both options default to off.
+
 `LLAMA_MOE_CACHE_PROFILE=1` reports `pread` and CRC timings by batch size. The worker sums can overlap. The caller's wait time includes both stages and worker scheduling, and upload time is measured separately. CRC CPU time excludes time when the worker is descheduled. `LLAMA_MOE_CACHE_TRACE` also enables these timings and records the device slot sizes for capacity replay. The tuning script's throughput estimates remain approximate for packed I/O.
 
 ## Picking the arguments

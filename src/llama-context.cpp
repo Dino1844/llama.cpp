@@ -652,6 +652,7 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    moe_cache.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
