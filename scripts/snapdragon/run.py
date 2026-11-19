@@ -53,6 +53,8 @@ MANAGED_ENV_NAMES = (
     "GGML_OPENCL_ADRENO_USE_LARGE_BUFFER",
     "GGML_SCHED_DEBUG",
     "LLAMA_MOE_CACHE_PACKED_DIR",
+    "LLAMA_MOE_CACHE_PREFETCH",
+    "LLAMA_MOE_CACHE_LAYOUT",
     "MTMD_BACKEND_DEVICE",
     "D",
     "DEVICE",
@@ -203,6 +205,8 @@ def main():
     parser.add_argument("--mtmd-device", help="Specify the backend device ID for Multi-Threaded Multi-Device setup (MTMD_BACKEND_DEVICE)")
     parser.add_argument("--no-embd-offload", action="store_true", help="Keep token embeddings and output projection on CPU (-ot token_embd.weight=CPU,output.weight=CPU)")
     parser.add_argument("--moe-cache-packed-dir", help="Packed Hexagon MoE experts directory on the execution target (LLAMA_MOE_CACHE_PACKED_DIR)")
+    parser.add_argument("--moe-cache-prefetch", type=int, choices=range(9), default=os.environ.get("LLAMA_MOE_CACHE_PREFETCH"), help="Expert prefetch depth (LLAMA_MOE_CACHE_PREFETCH)")
+    parser.add_argument("--moe-cache-layout", choices=("shared", "window"), default=os.environ.get("LLAMA_MOE_CACHE_LAYOUT"), help="Expert cache slot layout (LLAMA_MOE_CACHE_LAYOUT)")
 
     # Hexagon specific parameters
     parser.add_argument("--hex-verbose", help="Enable verbose logging (GGML_HEXAGON_VERBOSE)")
@@ -390,6 +394,8 @@ def main():
     set_env("GGML_HEXAGON_OPTRACE", args.hex_optrace)
     set_env("MTMD_BACKEND_DEVICE", args.mtmd_device)
     set_env("LLAMA_MOE_CACHE_PACKED_DIR", args.moe_cache_packed_dir)
+    set_env("LLAMA_MOE_CACHE_PREFETCH", args.moe_cache_prefetch)
+    set_env("LLAMA_MOE_CACHE_LAYOUT", args.moe_cache_layout)
 
     # OpenCL environment variables
     set_env("GGML_OPENCL_PLATFORM", args.cl_platform)

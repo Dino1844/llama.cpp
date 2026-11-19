@@ -33,11 +33,12 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
+        const llama_moe_cache * moe_cache,
+        int64_t n_tokens) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
-        if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
+        if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w, n_tokens) : nullptr) {
             forward.emplace(cached, t);
         }
     }
@@ -959,6 +960,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (moe_cache) {
+        moe_cache->end_batch();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -3053,7 +3057,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), ubatch.n_tokens);
         hadamard_verified = true;
     }
 
@@ -3146,6 +3150,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->begin_batch(sched.get());
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

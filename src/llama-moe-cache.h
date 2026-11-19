@@ -40,13 +40,14 @@ public:
     ~llama_moe_cache();
 
     // the experts of w in the cache, nullptr if w is not cached
-    ggml_tensor * get_experts(const ggml_tensor * w) const;
+    ggml_tensor * get_experts(const ggml_tensor * w, int64_t n_tokens = 0) const;
 
     // the graph of a MoE layer, built by llm_graph_context::build_moe_ffn in two steps:
 
     // 1. the lookup of the selected experts in the cache, built after the expert input and before the expert matmuls
     //    returns no slots if the layer does not read its experts from the cache for this ubatch
-    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts) const;
+    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer,
+            ggml_tensor * selected_experts, ggml_tensor * cur) const;
 
     // 2. the experts of a layer with slots, from the cache and from the host experts: [n_embd, n_expert_used, n_tokens]
     // calls build synchronously; does not retain user_data
@@ -55,6 +56,10 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+
+    void begin_batch(ggml_backend_sched_t sched);
+    // Called after the scheduler has finished consuming the graph's slots.
+    void end_batch();
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

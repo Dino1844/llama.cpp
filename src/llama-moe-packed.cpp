@@ -110,6 +110,26 @@ struct packed_layer {
     std::vector<uint32_t> checksums;
 };
 
+struct packed_staging {
+    std::unique_ptr<void, decltype(&std::free)> buffer { nullptr, std::free };
+    size_t capacity = 0;
+
+    void reserve(size_t size) {
+        if (size <= capacity) {
+            return;
+        }
+        void * ptr = nullptr;
+        const int rc = posix_memalign(&ptr, direct_alignment, size);
+        if (rc != 0) {
+            throw std::system_error(rc, std::generic_category(), "allocate packed expert staging");
+        }
+        buffer.reset(ptr);
+        capacity = size;
+    }
+
+    uint8_t * data() const { return static_cast<uint8_t *>(buffer.get()); }
+};
+
 #ifdef LLAMA_MOE_ARM_CRC32
 // Multiply reflected CRC32 residues modulo the IEEE polynomial.
 uint32_t packed_crc32_multiply(uint32_t a, uint32_t b) {
@@ -243,10 +263,7 @@ struct llama_moe_packed::impl {
     std::filesystem::path directory;
     std::unordered_map<int32_t, packed_entry> entries;
     std::unordered_map<int32_t, std::unique_ptr<packed_layer>> layers;
-    std::unique_ptr<void, decltype(&std::free)> staging { nullptr, std::free };
-    size_t capacity = 0;
-    const packed_layer * result = nullptr;
-    size_t result_count = 0;
+    packed_staging staging;
 
     std::vector<std::thread> workers;
     std::mutex mutex;
@@ -353,8 +370,7 @@ struct llama_moe_packed::impl {
             const size_t index = next++;
             const int32_t expert = (*jobs)[index];
             const packed_layer & layer = *active;
-            const size_t record = on_complete ? worker : index;
-            auto * dest = static_cast<uint8_t *>(staging.get()) + record * layer.stride;
+            auto * dest = staging.data() + worker * layer.stride;
             const bool measure = timing != nullptr;
             lock.unlock();
 
@@ -366,13 +382,11 @@ struct llama_moe_packed::impl {
                 failure = std::current_exception();
             }
 
-            if (on_complete) {
-                try {
-                    on_complete(index, failure ? nullptr : dest, layer.family_offsets);
-                } catch (...) {
-                    if (!failure) {
-                        failure = std::current_exception();
-                    }
+            try {
+                on_complete(index, failure ? nullptr : dest, layer.family_offsets);
+            } catch (...) {
+                if (!failure) {
+                    failure = std::current_exception();
                 }
             }
 
@@ -387,6 +401,17 @@ struct llama_moe_packed::impl {
                 complete.notify_one();
             }
         }
+    }
+
+    void read_one(int32_t il, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
+        const auto & layer = *layers.at(il);
+        if (expert < 0 || static_cast<size_t>(expert) >= layer.checksums.size()) {
+            throw std::out_of_range("invalid packed expert ID");
+        }
+        thread_local packed_staging scratch;
+        scratch.reserve(layer.stride);
+        packed_read_expert(layer, scratch.data(), expert, timing);
+        on_complete(0, scratch.data(), layer.family_offsets);
     }
 
     const char * layout() const {
@@ -459,8 +484,6 @@ struct llama_moe_packed::impl {
         if (jobs) {
             throw std::logic_error("packed expert read already active");
         }
-        result = nullptr;
-        result_count = 0;
         const packed_layer & layer = *layers.at(il);
         for (int32_t expert : experts) {
             if (expert < 0 || static_cast<size_t>(expert) >= layer.checksums.size()) {
@@ -468,20 +491,11 @@ struct llama_moe_packed::impl {
             }
         }
 
-        const size_t records = callback && !experts.empty() ? workers.size() : experts.size();
+        const size_t records = experts.empty() ? 0 : workers.size();
         if (std::max(records, experts.size()) > SIZE_MAX / layer.stride) {
             throw std::runtime_error("packed expert staging size overflow");
         }
-        const size_t size = records * layer.stride;
-        if (size > capacity) {
-            void * buffer = nullptr;
-            const int rc = posix_memalign(&buffer, direct_alignment, size);
-            if (rc != 0) {
-                throw std::system_error(rc, std::generic_category(), "allocate packed expert staging");
-            }
-            staging.reset(buffer);
-            capacity = size;
-        }
+        staging.reserve(records * layer.stride);
 
         active      = &layer;
         jobs        = &experts;
@@ -501,10 +515,6 @@ struct llama_moe_packed::impl {
         complete.wait(lock, [&] { return remaining == 0; });
 
         const size_t bytes = jobs->size() * active->payload_size;
-        if (!on_complete && !error && !jobs->empty()) {
-            result = active;
-            result_count = jobs->size();
-        }
         jobs = nullptr;
         active = nullptr;
         timing = nullptr;
@@ -515,12 +525,6 @@ struct llama_moe_packed::impl {
         return bytes;
     }
 
-    const uint8_t * data(size_t miss, size_t family) const {
-        if (!result || miss >= result_count) {
-            throw std::out_of_range("invalid packed expert result index");
-        }
-        return static_cast<const uint8_t *>(staging.get()) + miss * result->stride + result->family_offsets.at(family);
-    }
 };
 
 #else
@@ -531,10 +535,12 @@ struct llama_moe_packed::impl {
     }
 
     const char * layout() const { return ""; }
+    void read_one(int32_t, int32_t, const completion &, llama_moe_packed_timing *) const {
+        throw std::runtime_error("packed experts require O_DIRECT support");
+    }
     bool add_layer(int32_t, const std::vector<llama_moe_packed_tensor> &, bool) { return false; }
     void start(int32_t, const std::vector<int32_t> &, llama_moe_packed_timing *, completion) {}
     size_t join() { return 0; }
-    const uint8_t * data(size_t, size_t) const { return nullptr; }
 };
 
 #endif
@@ -552,9 +558,8 @@ bool llama_moe_packed::add_layer(int32_t layer, const std::vector<llama_moe_pack
     return pimpl->add_layer(layer, tensors, compact_q3k);
 }
 
-size_t llama_moe_packed::read(int32_t layer, const std::vector<int32_t> & experts, llama_moe_packed_timing * timing) {
-    pimpl->start(layer, experts, timing, {});
-    return pimpl->join();
+void llama_moe_packed::read_one(int32_t layer, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
+    pimpl->read_one(layer, expert, on_complete, timing);
 }
 
 void llama_moe_packed::start_async(int32_t layer, const std::vector<int32_t> & experts, completion on_complete,
@@ -567,8 +572,4 @@ void llama_moe_packed::start_async(int32_t layer, const std::vector<int32_t> & e
 
 size_t llama_moe_packed::join_async() {
     return pimpl->join();
-}
-
-const uint8_t * llama_moe_packed::data(size_t miss, size_t family) const {
-    return pimpl->data(miss, family);
 }

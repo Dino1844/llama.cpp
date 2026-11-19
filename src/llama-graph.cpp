@@ -1770,7 +1770,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w, slots->ne[1]) : w, cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2429,7 +2429,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts of host-resident layers may be read from the MoE cache (see llama_moe_cache::build_lookup)
     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
-        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
+        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts, cur);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -4107,18 +4107,23 @@ void llm_graph_context::build_conv_state_store(
 
     const size_t row_size  = s->nb[1];
     const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
+    const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t Kw = cparams.n_rs_seq == 0 ? 1 : std::min(n, K);
 
-    if (cparams.n_rs_seq == 0) {
-        ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
-                n_cols, channels, n_seqs,
-                conv_x->nb[1], conv_x->nb[2],
-                ggml_row_size(conv_x->type, n));
+    // Short histories can copy whole cells instead of scattering a narrow row per channel.
+    if (Kw <= 8) {
+        for (int64_t slot = Kw - 1; slot >= 0; --slot) {
+            ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+                    n_cols, channels, n_seqs,
+                    conv_x->nb[1], conv_x->nb[2],
+                    ggml_row_size(conv_x->type, n - slot));
 
-        ggml_tensor * cell = ggml_view_2d(ctx0, s,
-                n_cols*channels, n_seqs,
-                row_size, cell_offs);
+            ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                    n_cols*channels, n_seqs,
+                    row_size, cell_offs + slot*mctx_cur->get_size()*row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+        }
         return;
     }
 
@@ -4126,9 +4131,6 @@ void llm_graph_context::build_conv_state_store(
     // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
     //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
     // a rollback of k tokens reads slot k, and the memory allows k < n only (see rs_max), so slots from n on are left unwritten
-    const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
-    const int64_t Kw = std::min(n, K);
-
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
     ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);

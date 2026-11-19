@@ -795,10 +795,6 @@ static inline HVX_Vector unpack_q3_k_group_planes(HVX_Vector v_lo, HVX_Vector v_
     return Q6_V_vandor_VQR(unpack_q3_k_low2_plane(v_lo, g, mask_03), q_neg, 0xFCFCFCFC);
 }
 
-static inline HVX_Vector unpack_q3_k_group(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_03) {
-    return unpack_q3_k_group_planes(vptr[g >> 2], vptr[2], g, mask_03);
-}
-
 // same half split as accum_q6_k_32x1
 static inline HVX_VectorPair accum_q3_k_32x1(
     HVX_Vector v_q0, HVX_Vector v_q1, HVX_Vector v_neg,
@@ -820,7 +816,7 @@ static inline HVX_VectorPair accum_q3_k_32x1(
 }
 
 static inline void accum_q3_k_32x2(
-    const HVX_Vector * restrict vptr,
+    HVX_Vector v_q0, HVX_Vector v_q1, HVX_Vector v_neg,
     const HVX_Vector * restrict v_act0,
     const HVX_Vector * restrict v_act1,
     HVX_VectorPair * v_sums0,
@@ -834,8 +830,8 @@ static inline void accum_q3_k_32x2(
 
     #pragma unroll
     for (int g = 0; g < 4; g++) {
-        HVX_Vector v_W_lo = unpack_q3_k_group(vptr, g,     mask_03);
-        HVX_Vector v_W_hi = unpack_q3_k_group(vptr, g + 4, mask_03);
+        HVX_Vector v_W_lo = unpack_q3_k_group_planes(v_q0, v_neg, g,     mask_03);
+        HVX_Vector v_W_hi = unpack_q3_k_group_planes(v_q1, v_neg, g + 4, mask_03);
         v_sum0_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_lo, v_W_lo, v_act0[g]);
         v_sum0_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum0_hi, v_W_hi, v_act0[g + 4]);
         v_sum1_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum1_lo, v_W_lo, v_act1[g]);
@@ -1606,6 +1602,15 @@ static inline HVX_Vector q3_k_compact_scales(HVX_Vector v_low, HVX_Vector v_high
     return Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(Q6_Vhf_equals_Vh(v_scale_h), v_d));
 }
 
+static inline HVX_Vector q3_k_compact_accumulate(HVX_Vector sum, HVX_VectorPair dots, HVX_Vector scale, HVX_Vector act_scale) {
+    // Prevent the compiler from carrying qf32 through the unrolled tiles.
+    HVX_Vector tile_sum = scale_q6_k_32x1(dots, scale, act_scale);
+    __asm__ volatile("" : "+v"(tile_sum));
+    sum = hvx_vec_add_f32_f32(sum, tile_sum);
+    __asm__ volatile("" : "+v"(sum));
+    return sum;
+}
+
 static void tiled_vec_dot_q3_k_compact_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
     const uint8_t * restrict group = vx;
     const HVX_Vector * restrict v_act = vy;
@@ -1621,12 +1626,7 @@ static void tiled_vec_dot_q3_k_compact_32x1(const uint32_t n, float * restrict s
             const uint8_t * tile = group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8);
             const HVX_Vector v_D = q3_k_compact_scales((kt & 2) ? v_low1 : v_low0, v_high, v_d, kt);
             HVX_VectorPair v_sums = accum_q3_k_32x1(hvx_vmemu(tile), hvx_vmemu(tile + 128), hvx_vmemu(tile + 256), v_act);
-            // Keep the same fp32 rounding at each tile boundary as the legacy loop.
-            // The Hexagon compiler otherwise carries qf32 through the unrolled tiles.
-            HVX_Vector v_tile_sum = scale_q6_k_32x1(v_sums, v_D, v_act[8]);
-            __asm__ volatile("" : "+v"(v_tile_sum));
-            v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_tile_sum);
-            __asm__ volatile("" : "+v"(v_sum_float));
+            v_sum_float = q3_k_compact_accumulate(v_sum_float, v_sums, v_D, v_act[8]);
         }
     }
 
@@ -1634,6 +1634,34 @@ static void tiled_vec_dot_q3_k_compact_32x1(const uint32_t n, float * restrict s
         v_sum_float = hvx_vec_add_f32_f32(v_sum_float, hvx_vmemu(sz));
     }
     hvx_vec_store_u(s, valid_rows * sizeof(float), v_sum_float);
+}
+
+static void tiled_vec_dot_q3_k_compact_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx,
+        const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows) {
+    const uint8_t * restrict group = vx;
+    const HVX_Vector * restrict v_act0 = vy0;
+    const HVX_Vector * restrict v_act1 = vy1;
+    const HVX_VectorPred first_half = Q6_Q_vsetq_R(64);
+    HVX_Vector sum0 = Q6_V_vzero();
+    HVX_Vector sum1 = Q6_V_vzero();
+
+    for (uint32_t k = 0; k < n; k += 256, group += HTP_Q3K_COMPACT_GROUP_BYTES) {
+        HVX_Vector v_d, v_low0, v_low1, v_high;
+        q3_k_compact_load_scales(group, first_half, &v_d, &v_low0, &v_low1, &v_high);
+
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt, v_act0 += 9, v_act1 += 9) {
+            const uint8_t * tile = group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8);
+            const HVX_Vector scale = q3_k_compact_scales((kt & 2) ? v_low1 : v_low0, v_high, v_d, kt);
+            HVX_VectorPair dots0, dots1;
+            accum_q3_k_32x2(hvx_vmemu(tile), hvx_vmemu(tile + 128), hvx_vmemu(tile + 256), v_act0, v_act1, &dots0, &dots1);
+            sum0 = q3_k_compact_accumulate(sum0, dots0, scale, v_act0[8]);
+            sum1 = q3_k_compact_accumulate(sum1, dots1, scale, v_act1[8]);
+        }
+    }
+
+    hvx_vec_store_u(s0, valid_rows * sizeof(float), sum0);
+    hvx_vec_store_u(s1, valid_rows * sizeof(float), sum1);
 }
 
 static void tiled_vec_dot_q3_k_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
@@ -1651,7 +1679,7 @@ static void tiled_vec_dot_q3_k_32x2(const uint32_t n, float * restrict s0, float
         const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
 
         HVX_VectorPair v_sums0, v_sums1;
-        accum_q3_k_32x2(vptr, v_act0, v_act1, &v_sums0, &v_sums1);
+        accum_q3_k_32x2(vptr[0], vptr[1], vptr[2], v_act0, v_act1, &v_sums0, &v_sums1);
 
         v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, scale_q6_k_32x1(v_sums0, vptr[3], v_act0[8]));
         v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, scale_q6_k_32x1(v_sums1, vptr[3], v_act1[8]));

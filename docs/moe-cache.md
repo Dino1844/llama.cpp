@@ -44,7 +44,11 @@ On a miss the reader uses one aligned read per expert and checks the record's CR
 
 `GGML_HEXAGON_MOE_HMX_PIPELINE=1` enables the routed HMX pipeline when the tensor shape and VTCM budget permit it. `LLAMA_MOE_CACHE_READY=1` optionally lets eligible multi-row packed batches submit same-layer expert work while missing weights are read and verified. Both options default to off.
 
-`LLAMA_MOE_CACHE_PROFILE=1` reports `pread` and CRC timings by batch size. The worker sums can overlap. The caller's wait time includes both stages and worker scheduling, and upload time is measured separately. CRC CPU time excludes time when the worker is descheduled. `LLAMA_MOE_CACHE_TRACE` also enables these timings and records the device slot sizes for capacity replay. The tuning script's throughput estimates remain approximate for packed I/O.
+`LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches use a separate shared bank. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). With no layout specified, positive depth selects windows and zero depth selects the shared cache. Set `LLAMA_MOE_CACHE_LAYOUT=window` in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout` and `--moe-cache-prefetch`.
+
+The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. The CPU publishes the slot IDs after all selected reads complete, and the scheduler keeps the slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
+
+`LLAMA_MOE_CACHE_PROFILE=1` reports `pread`, CRC and upload timings. The worker sums can overlap. Demand wait includes scheduling and all three stages. The prefetch wait field sums worker elapsed time without implying a stall in inference. CRC CPU time excludes time when the worker is descheduled. `LLAMA_MOE_CACHE_TRACE` also records routed expert IDs and physical slot sizes. The tuning script simulates the shared cache policy.
 
 ## Picking the arguments
 

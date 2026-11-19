@@ -32,9 +32,11 @@ public:
 
     const char * layout() const;
     bool add_layer(int32_t layer, const std::vector<llama_moe_packed_tensor> & tensors, bool compact_q3k);
-    size_t read(int32_t layer, const std::vector<int32_t> & experts, llama_moe_packed_timing * timing = nullptr);
-
     using completion = std::function<void(size_t miss, const uint8_t * record, const std::vector<size_t> & family_offsets)>;
+
+    // Independent lookahead workers use their own aligned scratch and the same validated files.
+    void read_one(int32_t layer, int32_t expert, const completion & on_complete,
+                    llama_moe_packed_timing * timing = nullptr) const;
 
     // One controlling thread must join each batch before starting another or destroying the reader.
     // Keep experts unchanged and timing valid until join_async returns or throws.
@@ -43,9 +45,6 @@ public:
                      llama_moe_packed_timing * timing = nullptr);
     // Waits for all callbacks before returning the payload bytes or rethrowing a worker error.
     size_t join_async();
-
-    // Valid until the next batch. Families use the order passed to add_layer.
-    const uint8_t * data(size_t miss, size_t family) const;
 
 private:
     struct impl;

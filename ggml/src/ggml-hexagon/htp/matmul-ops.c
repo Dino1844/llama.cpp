@@ -1317,6 +1317,7 @@ static void hvx_mm_4d_flat(const htp_thread_t * th, unsigned int nth, unsigned i
 
 struct htp_hvx_routed_weight_layout {
     htp_vec_dot_32x1_t vec_dot;
+    bool compact_q3k;
     uint32_t tile_bytes;
     uint32_t vtcm_tile_bytes;
     uint32_t k_tiles;
@@ -1330,7 +1331,7 @@ static inline struct htp_hvx_routed_weight_layout htp_hvx_routed_weight_layout(
         // The wire format describes one contiguous, padded slab of 32 output rows.
         const uint32_t slab_bytes = w->nb[1] * 32;
         return (struct htp_hvx_routed_weight_layout) {
-            tiled_vec_dot_q3_k_compact_32x1, slab_bytes, slab_bytes, 1, slab_bytes, slab_bytes,
+            tiled_vec_dot_q3_k_compact_32x1, true, slab_bytes, slab_bytes, 1, slab_bytes, slab_bytes,
         };
     }
 
@@ -1338,8 +1339,42 @@ static inline struct htp_hvx_routed_weight_layout htp_hvx_routed_weight_layout(
     const uint32_t vtcm_tile_bytes = htp_tensor_get_tile_padded_size(w->type);
     const uint32_t k_tiles = w->ne[0] / htp_tensor_get_tile_k(w->type);
     return (struct htp_hvx_routed_weight_layout) {
-        vec_dot, tile_bytes, vtcm_tile_bytes, k_tiles, k_tiles * tile_bytes, k_tiles * vtcm_tile_bytes,
+        vec_dot, false, tile_bytes, vtcm_tile_bytes, k_tiles, k_tiles * tile_bytes, k_tiles * vtcm_tile_bytes,
     };
+}
+
+struct htp_hvx_routed_row {
+    const uint8_t * act;
+    float * dst;
+};
+
+static inline struct htp_hvx_routed_row htp_hvx_routed_row(const struct htp_mm_context * mmctx,
+        const struct htp_tensor * dst, struct mmid_row_mapping row, uint32_t ct) {
+    const uint32_t n_act = mmctx->act->ne[1];
+    const uint32_t ir1 = fastmodulo(row.i1, n_act, &mmctx->mm_div_ne11);
+    return (struct htp_hvx_routed_row) {
+        mmctx->vtcm_act + (ir1 + row.i2 * n_act) * mmctx->vtcm_act_stride,
+        (float *) (dst->data + row.i1 * dst->nb[1] + row.i2 * dst->nb[2]) + ct * 32,
+    };
+}
+
+static inline void htp_hvx_routed_dot(const struct htp_mm_context * mmctx, const struct htp_tensor * dst,
+        const struct htp_hvx_routed_weight_layout * w, const uint8_t * tile, uint32_t expert, uint32_t ct,
+        uint32_t count, uint32_t valid_rows) {
+    const struct mmid_row_mapping * matrix_rows = mmctx->matrix_rows;
+    const uint32_t k = mmctx->act->ne[0];
+    uint32_t i = 0;
+    if (w->compact_q3k) {
+        for (; i + 1 < count; i += 2) {
+            const struct htp_hvx_routed_row a = htp_hvx_routed_row(mmctx, dst, MMID_MATRIX_ROW(expert, i), ct);
+            const struct htp_hvx_routed_row b = htp_hvx_routed_row(mmctx, dst, MMID_MATRIX_ROW(expert, i + 1), ct);
+            tiled_vec_dot_q3_k_compact_32x2(k, a.dst, b.dst, tile, a.act, b.act, valid_rows);
+        }
+    }
+    for (; i < count; ++i) {
+        const struct htp_hvx_routed_row row = htp_hvx_routed_row(mmctx, dst, MMID_MATRIX_ROW(expert, i), ct);
+        w->vec_dot(k, row.dst, tile, row.act, valid_rows, NULL);
+    }
 }
 
 static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
@@ -1361,13 +1396,9 @@ static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned 
     const uint32_t n_as  = ne02;        // n_expert
 
     const uint32_t *                matrix_row_counts = mmctx->matrix_row_counts;
-    const struct mmid_row_mapping * matrix_rows       = mmctx->matrix_rows;
-
-    const size_t act_stride = mmctx->vtcm_act_stride;
 
     // Per-thread VTCMs for all tensors
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
-    uint8_t * restrict act_data = mmctx->vtcm_act;
     const struct htp_hvx_routed_weight_layout w = htp_hvx_routed_weight_layout(src0, mmctx->vec_dot_32x1);
     const uint32_t ct_start = src0_start_row / 32;
     const uint32_t ct_end   = (src0_end_row + 31) / 32;
@@ -1393,17 +1424,7 @@ static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned 
             valid_rows = MIN(32, MAX(0, valid_rows));
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-            for (uint32_t cid = 0; cid < cne1; ++cid) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
-                const int               rm1         = row_mapping.i1;  // expert idx
-                const int               rm2         = row_mapping.i2;  // token idx
-
-                const uint32_t ir1 = fastmodulo(rm1, ne11, &mmctx->mm_div_ne11);        // act row idx
-                const uint8_t * restrict act_col = (const uint8_t *) (act_data + (ir1 + rm2 * ne11 + 0) * act_stride);
-                float * restrict dst_row = (float *) (dst->data + (rm1 * nb1 + rm2 * nb2 + 0));
-
-                w.vec_dot(ne10, &dst_row[ct * 32], w_tile, act_col, valid_rows, NULL);
-            }
+            htp_hvx_routed_dot(mmctx, dst, &w, w_tile, cur_a, ct, cne1, valid_rows);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
             if (push_ct < ct_end) {
@@ -1570,7 +1591,6 @@ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_weights      = kparams->n_weights;
     const struct htp_tensor * restrict src0 = octx->src[0];
-    const struct htp_tensor * restrict act  = octx->src[n_weights];
     struct htp_thread_trace * tr = th->trace;
 
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -1579,12 +1599,8 @@ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
     const uint32_t n_as = src0->ne[2];
 
     const uint32_t * matrix_row_counts = mmctx->matrix_row_counts;
-    const struct mmid_row_mapping * matrix_rows = mmctx->matrix_rows;
-
-    const size_t act_stride = mmctx->vtcm_act_stride;
 
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
-    uint8_t * restrict act_data = mmctx->vtcm_act;
 
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
@@ -1634,17 +1650,7 @@ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
                 valid_rows = MIN(32, MAX(0, valid_rows));
 
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-                for (uint32_t cid = 0; cid < (uint32_t) cne1; ++cid) {
-                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
-                    const int rm1 = row_mapping.i1;
-                    const int rm2 = row_mapping.i2;
-
-                    const uint32_t ir1 = fastmodulo(rm1, act->ne[1], &mmctx->mm_div_ne11);
-                    const uint8_t * restrict act_col = (const uint8_t *) (act_data + (ir1 + rm2 * act->ne[1]) * act_stride);
-                    float * restrict dst_row = (float *) (dst->data + (rm1 * dst->nb[1] + rm2 * dst->nb[2]));
-
-                    w.vec_dot(act->ne[0], &dst_row[ct * 32], w_tile, act_col, valid_rows, NULL);
-                }
+                htp_hvx_routed_dot(mmctx, dst, &w, w_tile, cur_a, ct, cne1, valid_rows);
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
 
                 if (push_ct < ct_end) {
