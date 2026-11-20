@@ -2843,11 +2843,17 @@ static int64_t ggml_hexagon_moe_rank(const ggml_cgraph * graph, const htp_opnode
     }
 
     const auto * ids = static_cast<const int32_t *>(slots->data);
-    const auto * missing = std::find(ids, ids + ranks, fill.slot);
-    if (missing == ids + ranks || std::find(missing + 1, ids + ranks, fill.slot) != ids + ranks) {
-        return -1;
+    int64_t missing = -1;
+    for (const auto * at = ids; at != ids + ranks; ++at) {
+        const int32_t id = *at;
+        if (id < 0 || id >= fill.bank->ne[2] || std::find(ids, at, id) != at) {
+            return -1;
+        }
+        if (id == fill.slot) {
+            missing = at - ids;
+        }
     }
-    return missing - ids;
+    return missing;
 }
 
 static bool ggml_hexagon_slice_moe(ggml_hexagon_session * sess, const htp_opnode * chain, int64_t rank,
@@ -2881,6 +2887,9 @@ static bool ggml_hexagon_slice_moe(ggml_hexagon_session * sess, const htp_opnode
     const std::array<int64_t, 3> first{0, rank + 1, rank};
     const std::array<int64_t, 3> count{rank, output->ne[1] - rank - 1, 1};
     auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(sess->moe_scratch));
+    const auto is_hvx_quant = [](uint8_t kernel) {
+        return kernel == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel == HTP_MM_KERNEL_HVX_QUANT_BLOCK;
+    };
     for (size_t phase = 0; phase < phases.size(); ++phase) {
         if (!count[phase]) {
             continue;
@@ -2919,7 +2928,10 @@ static bool ggml_hexagon_slice_moe(ggml_hexagon_session * sess, const htp_opnode
             if (op.opcode == HTP_OP_MUL_MAT_ID) {
                 const auto * original = chain[i].kparams<htp_mm_kernel_params>();
                 const auto * sliced   = op.kparams<htp_mm_kernel_params>();
-                if (original->kernel_type != sliced->kernel_type || original->n_hmx != sliced->n_hmx) {
+                // The routed HVX modes use the same per-block quantization and dot products.
+                const bool same_math = original->kernel_type == sliced->kernel_type ||
+                    (is_hvx_quant(original->kernel_type) && is_hvx_quant(sliced->kernel_type));
+                if (!same_math || original->n_hmx != sliced->n_hmx) {
                     return false;
                 }
             }
