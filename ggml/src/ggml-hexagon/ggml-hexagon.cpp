@@ -314,6 +314,14 @@ struct ggml_hexagon_moe_fill {
     void * data = nullptr;
 };
 
+struct ggml_hexagon_moe_stats {
+    size_t overlapped = 0;
+    size_t fallback = 0;
+    size_t paceable = 0;
+    size_t held = 0;
+    uint64_t hold_ns = 0;
+};
+
 struct ggml_hexagon_session {
     std::string      name;
     remote_handle64  handle;
@@ -353,11 +361,7 @@ struct ggml_hexagon_session {
     ggml_hexagon_moe_fill moe_fill;
     ggml_backend_buffer_t moe_scratch = nullptr;
     htp_moe_pacer moe_pacer;
-    size_t moe_overlapped = 0;
-    size_t moe_fallback = 0;
-    size_t moe_paceable = 0;
-    size_t moe_held = 0;
-    uint64_t moe_hold_ns = 0;
+    ggml_hexagon_moe_stats moe_stats;
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -2048,8 +2052,8 @@ void ggml_hexagon_session::finish_moe_pacing() {
     }
     const int64_t hold_ns = moe_pacer.finish();
     if (hold_ns > 0) {
-        ++moe_held;
-        moe_hold_ns += hold_ns;
+        ++moe_stats.held;
+        moe_stats.hold_ns += hold_ns;
     }
 }
 
@@ -2654,10 +2658,6 @@ void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     finish_moe_pacing();
-    if (moe_overlapped || moe_fallback) {
-        GGML_LOG_INFO("ggml-hex: %s moe overlap: layers=%zu fallback=%zu held=%zu hold_ns=%" PRIu64 " paceable=%zu\n",
-                c_name(), moe_overlapped, moe_fallback, moe_held, moe_hold_ns, moe_paceable);
-    }
     this->mdev.sessions.clear();
 
     int err;
@@ -2759,8 +2759,13 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
-    // we just need to delete the backend here
-    // the sessions are allocated & freed as part of the registry
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    // The registry keeps the session alive across backend handles.
+    const auto stats = std::exchange(sess->moe_stats, {});
+    if (stats.overlapped || stats.fallback || stats.held) {
+        GGML_LOG_INFO("ggml-hex: %s moe overlap: layers=%zu fallback=%zu held=%zu hold_ns=%" PRIu64 " paceable=%zu\n",
+                sess->c_name(), stats.overlapped, stats.fallback, stats.held, stats.hold_ns, stats.paceable);
+    }
     delete backend;
 }
 
@@ -2807,9 +2812,15 @@ static int64_t ggml_hexagon_moe_rank(const ggml_cgraph * graph, const htp_opnode
     if (down->src[0] != fill.bank || down->src[1] != activation || gate->src[1] != input ||
             up->src[2] != slots || gate->src[2] != slots || !input || input->ne[1] != 1 ||
             input->ne[2] != 1 || input->ne[3] != 1 || ranks < 2 ||
-            !slots || !slots->data || slots->type != GGML_TYPE_I32 || slots->op != GGML_OP_NONE ||
+            !slots || !slots->data || slots->type != GGML_TYPE_I32 || slots->view_src ||
             slots->ne[0] != ranks || slots->ne[1] != 1 || slots->ne[2] != 1 || slots->ne[3] != 1 ||
             !ggml_is_contiguous(slots)) {
+        return -1;
+    }
+    auto * end = graph->nodes + graph->n_nodes;
+    // The scheduler can pass the CPU slot lookup directly through a shared host buffer.
+    if (slots->op != GGML_OP_NONE && (!slots->buffer || !ggml_backend_buffer_is_host(slots->buffer) ||
+            std::find(graph->nodes, end, slots) != end)) {
         return -1;
     }
     if (!((activation->src[0] == up && activation->src[1] == gate) ||
@@ -2824,15 +2835,13 @@ static int64_t ggml_hexagon_moe_rank(const ggml_cgraph * graph, const htp_opnode
             return -1;
         }
         if (i < 3) {
-            const auto * at = std::find(graph->nodes, graph->nodes + graph->n_nodes, t);
-            if (at == graph->nodes + graph->n_nodes ||
-                    !ggml_node_has_n_uses(graph, at - graph->nodes, 1)) {
+            const auto * at = std::find(graph->nodes, end, t);
+            if (at == end || !ggml_node_has_n_uses(graph, at - graph->nodes, 1)) {
                 return -1;
             }
         }
     }
 
-    // The input copy from the host slot lookup has completed before graph dispatch.
     const auto * ids = static_cast<const int32_t *>(slots->data);
     const auto * missing = std::find(ids, ids + ranks, fill.slot);
     if (missing == ids + ranks || std::find(missing + 1, ids + ranks, fill.slot) != ids + ranks) {
@@ -2957,9 +2966,9 @@ static ggml_status ggml_hexagon_submit_moe(ggml_hexagon_session * sess, const gg
             }
         }
         const bool paceable = isolated && sess->batch_req_seq == seq;
-        sess->moe_paceable += paceable;
+        sess->moe_stats.paceable += paceable;
         const bool pace = paceable && sess->moe_pacer.enabled();
-        const uint64_t hold_before = sess->moe_hold_ns;
+        const uint64_t hold_before = sess->moe_stats.hold_ns;
         sess->flush_async(pace);
         const uint64_t hit_seq = sess->batch_req_seq;
         const int64_t read_begin = opt_profile ? ggml_time_us() : 0;
@@ -2971,7 +2980,7 @@ static ggml_status ggml_hexagon_submit_moe(ggml_hexagon_session * sess, const gg
         if (opt_profile) {
             GGML_LOG_INFO("ggml-hex: %s moe overlap: seq=%" PRIu64 "..%" PRIu64 " read_begin_us=%" PRId64
                           " read_end_us=%" PRId64 " hold_ns=%" PRIu64 "\n", sess->c_name(), seq + 1,
-                    hit_seq, read_begin, read_end, sess->moe_hold_ns - hold_before);
+                    hit_seq, read_begin, read_end, sess->moe_stats.hold_ns - hold_before);
         }
         if (!loaded || sess->last_error > HTP_STATUS_OK) {
             sess->flush_sync();
@@ -2984,11 +2993,11 @@ static ggml_status ggml_hexagon_submit_moe(ggml_hexagon_session * sess, const gg
         for (size_t j = i + 4; j < nodes.size(); ++j) {
             sess->enqueue_op(nodes[j]);
         }
-        ++sess->moe_overlapped;
+        ++sess->moe_stats.overlapped;
         return GGML_STATUS_SUCCESS;
     }
 
-    ++sess->moe_fallback;
+    ++sess->moe_stats.fallback;
     if (!fill.load(fill.data)) {
         return GGML_STATUS_FAILED;
     }
