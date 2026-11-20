@@ -39,20 +39,22 @@ class MoeCacheConfigurationTests(unittest.TestCase):
         return dict(word.split("=", 1) for word in shlex.split(command) if "=" in word)
 
     def test_environment_reaches_each_transport(self):
-        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "window"}
+        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "window",
+               "LLAMA_MOE_CACHE_OVERLAP": "1", "GGML_HEXAGON_MOE_PACING_FILE": "/tmp/phase snapshot"}
         for target in (None, "android:test-phone", "linux:test-host"):
             with self.subTest(target=target):
                 child = self.run_launcher(target, env=env)
                 self.assertEqual({name: child.get(name) for name in env}, env)
 
     def test_cli_overrides_environment_and_preserves_zero_depth(self):
-        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "shared"}
-        options = ["--moe-cache-prefetch", "0", "--moe-cache-layout", "window"]
+        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "shared", "LLAMA_MOE_CACHE_OVERLAP": "1"}
+        options = ["--moe-cache-prefetch", "0", "--moe-cache-layout", "window", "--moe-cache-overlap", "0"]
         for target in (None, "android:test-phone", "linux:test-host"):
             with self.subTest(target=target):
                 child = self.run_launcher(target, options, env)
                 self.assertEqual(child.get("LLAMA_MOE_CACHE_PREFETCH"), "0")
                 self.assertEqual(child.get("LLAMA_MOE_CACHE_LAYOUT"), "window")
+                self.assertEqual(child.get("LLAMA_MOE_CACHE_OVERLAP"), "0")
 
     def test_omitted_configuration_stays_unspecified(self):
         for target in (None, "android:test-phone", "linux:test-host"):

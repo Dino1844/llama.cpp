@@ -342,6 +342,7 @@ struct llama_moe_cache::impl {
         size_t (*pack_expert)(void *, const void *, int, int64_t, int64_t) = nullptr;
         void (*upload_packed)(ggml_tensor *, const void *, size_t) = nullptr;
         uint32_t * (*set_expert_ready)(ggml_backend_t, ggml_tensor * const *, size_t, size_t) = nullptr;
+        bool (*defer_fill)(ggml_backend_t, const ggml_tensor *, int32_t, bool (*)(void *), void *) = nullptr;
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
 
@@ -426,6 +427,7 @@ struct llama_moe_cache::impl {
     std::unique_ptr<llama_moe_window> windows;
     int32_t prefetch_depth = 0;
     bool window_batch_in_use = false;
+    int32_t deferred_window_layer = -1;
     std::vector<int32_t> packed_ids;
 
     int32_t ready_layer = -1;
@@ -456,6 +458,8 @@ struct llama_moe_cache::impl {
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         const char * ready = std::getenv("LLAMA_MOE_CACHE_READY");
         const bool ready_enabled = ready && std::strcmp(ready, "1") == 0;
+        const char * overlap = std::getenv("LLAMA_MOE_CACHE_OVERLAP");
+        const bool overlap_enabled = overlap && std::strcmp(overlap, "1") == 0;
         const char * pack_path = std::getenv("LLAMA_MOE_CACHE_PACKED_DIR");
         if (const char * value = std::getenv("LLAMA_MOE_CACHE_PREFETCH")) {
             char * end = nullptr;
@@ -505,6 +509,10 @@ struct llama_moe_cache::impl {
                             if (ready_enabled && !window_layout) {
                                 d.set_expert_ready = reinterpret_cast<decltype(d.set_expert_ready)>(
                                         ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_set_expert_ready"));
+                            }
+                            if (overlap_enabled && window_layout) {
+                                d.defer_fill = reinterpret_cast<decltype(d.defer_fill)>(
+                                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_defer_moe_fill"));
                             }
                         }
                     }
@@ -956,6 +964,12 @@ struct llama_moe_cache::impl {
     }
 
     void end_batch() {
+        if (deferred_window_layer >= 0) {
+            const layer & l = layers[deferred_window_layer];
+            const device & d = devices[groups[l.ig].id];
+            d.defer_fill(d.backend, nullptr, 0, nullptr, nullptr);
+            deferred_window_layer = -1;
+        }
         if (window_batch_in_use) {
             windows->release_all();
             window_batch_in_use = false;
@@ -1072,7 +1086,7 @@ struct llama_moe_cache::impl {
     }
 
     size_t fill_slots(layer & l, const std::vector<ggml_tensor *> & banks, const std::vector<llama_moe_window_fill> & needed,
-            packed_profile & profile) {
+            packed_profile & profile, bool foreground = false) {
         if (needed.empty()) {
             return 0;
         }
@@ -1081,7 +1095,7 @@ struct llama_moe_cache::impl {
             std::atomic<int64_t> upload_us {0};
             const int64_t start = profile_packed ? ggml_time_us() : 0;
             try {
-                start_packed(l, needed, [&](size_t i, const uint8_t * record, const std::vector<size_t> & offsets) {
+                const auto upload = [&](size_t i, const uint8_t * record, const std::vector<size_t> & offsets) {
                     if (record) {
                         const int64_t upload_start = profile_packed ? ggml_time_us() : 0;
                         upload_packed_record(l, banks, needed[i].slot, record, offsets);
@@ -1089,8 +1103,16 @@ struct llama_moe_cache::impl {
                             upload_us.fetch_add(ggml_time_us() - upload_start, std::memory_order_relaxed);
                         }
                     }
-                }, profile_packed ? &timing : nullptr);
-                const size_t bytes = packed->join_async();
+                };
+                size_t bytes;
+                auto * measured = profile_packed ? &timing : nullptr;
+                if (foreground) {
+                    GGML_ASSERT(needed.size() == 1);
+                    bytes = packed->read_one(l.il, needed.front().expert, upload, measured);
+                } else {
+                    start_packed(l, needed, upload, measured);
+                    bytes = packed->join_async();
+                }
                 if (profile_packed) {
                     profile.workers.add(timing);
                     profile.records += needed.size();
@@ -1146,6 +1168,22 @@ struct llama_moe_cache::impl {
         return ordered;
     }
 
+    static bool finish_window_fill(void * opaque) {
+        auto & l = *static_cast<layer *>(opaque);
+        auto & self = *l.owner;
+        GGML_ASSERT(self.deferred_window_layer == l.il);
+        self.deferred_window_layer = -1;
+        try {
+            self.windows->finish_deferred([&](int32_t, const std::vector<llama_moe_window_fill> & fills) {
+                self.fill_slots(l, l.window_banks, fills, self.packed_window, true);
+            });
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to fill MoE window for layer %d: %s\n", __func__, l.il, err.what());
+            return false;
+        }
+        return true;
+    }
+
     void resolve_window(int32_t il, const ggml_tensor * ids, const ggml_tensor * near, const ggml_tensor * far, ggml_tensor * dst) {
         GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
         auto * slots = static_cast<int32_t *>(dst->data);
@@ -1154,7 +1192,19 @@ struct llama_moe_cache::impl {
         window_batch_in_use = true;
         write_trace(il, ids->ne[0], experts, n);
         if (ids->ne[1] <= window_max_rows) {
-            windows->resolve(il, experts, n, slots, prediction(near), prediction(far));
+            auto & l = layers[il];
+            const device & d = devices[groups[l.ig].id];
+            llama_moe_window::defer_load defer;
+            if (d.defer_fill && l.use_packed && ids->ne[1] == 1 && l.window_banks.size() == 3 && deferred_window_layer < 0) {
+                defer = [&](const llama_moe_window_fill & f) {
+                    if (!d.defer_fill(d.backend, l.window_banks.back(), f.slot, finish_window_fill, &l)) {
+                        return false;
+                    }
+                    deferred_window_layer = il;
+                    return true;
+                };
+            }
+            windows->resolve(il, experts, n, slots, prediction(near), prediction(far), defer);
             return;
         }
 

@@ -25,6 +25,7 @@ MANAGED_ENV_NAMES = (
     "GGML_HEXAGON_OPBATCH",
     "GGML_HEXAGON_OPQUEUE",
     "GGML_HEXAGON_OPPOLL",
+    "GGML_HEXAGON_MOE_PACING_FILE",
     "GGML_HEXAGON_OPFILTER",
     "GGML_HEXAGON_OPFUSION",
     "GGML_HEXAGON_RT_REPACK",
@@ -55,6 +56,7 @@ MANAGED_ENV_NAMES = (
     "LLAMA_MOE_CACHE_PACKED_DIR",
     "LLAMA_MOE_CACHE_PREFETCH",
     "LLAMA_MOE_CACHE_LAYOUT",
+    "LLAMA_MOE_CACHE_OVERLAP",
     "MTMD_BACKEND_DEVICE",
     "D",
     "DEVICE",
@@ -207,10 +209,12 @@ def main():
     parser.add_argument("--moe-cache-packed-dir", help="Packed Hexagon MoE experts directory on the execution target (LLAMA_MOE_CACHE_PACKED_DIR)")
     parser.add_argument("--moe-cache-prefetch", type=int, choices=range(9), default=os.environ.get("LLAMA_MOE_CACHE_PREFETCH"), help="Expert prefetch depth (LLAMA_MOE_CACHE_PREFETCH)")
     parser.add_argument("--moe-cache-layout", choices=("shared", "window"), default=os.environ.get("LLAMA_MOE_CACHE_LAYOUT"), help="Expert cache slot layout (LLAMA_MOE_CACHE_LAYOUT)")
+    parser.add_argument("--moe-cache-overlap", type=int, choices=(0, 1), default=os.environ.get("LLAMA_MOE_CACHE_OVERLAP"), help="Overlap one missing expert with resident Hexagon experts (LLAMA_MOE_CACHE_OVERLAP)")
 
     # Hexagon specific parameters
     parser.add_argument("--hex-verbose", help="Enable verbose logging (GGML_HEXAGON_VERBOSE)")
     parser.add_argument("--hex-profile", help="Enable NPU/Hexagon profiling and performance metrics print (GGML_HEXAGON_PROFILE)")
+    parser.add_argument("--hex-moe-pacing-file", default=os.environ.get("GGML_HEXAGON_MOE_PACING_FILE"), help="MoE pacing snapshot path on the execution target (GGML_HEXAGON_MOE_PACING_FILE)")
     parser.add_argument("--hex-nhvx", help="Number of HVX units to use (GGML_HEXAGON_NHVX)")
     parser.add_argument("--hex-nhmx", help="Number of HMX units to use. 0 disables HMX power-up (GGML_HEXAGON_NHMX)")
     parser.add_argument("--hex-power-mode", help="HTP DCVS/HMX power mode: low_power_saver, power_saver, high_power_saver, low_balanced, balanced, high_performance, sustained_high_performance, burst (GGML_HEXAGON_POWER_MODE)")
@@ -396,6 +400,8 @@ def main():
     set_env("LLAMA_MOE_CACHE_PACKED_DIR", args.moe_cache_packed_dir)
     set_env("LLAMA_MOE_CACHE_PREFETCH", args.moe_cache_prefetch)
     set_env("LLAMA_MOE_CACHE_LAYOUT", args.moe_cache_layout)
+    set_env("LLAMA_MOE_CACHE_OVERLAP", args.moe_cache_overlap)
+    set_env("GGML_HEXAGON_MOE_PACING_FILE", args.hex_moe_pacing_file)
 
     # OpenCL environment variables
     set_env("GGML_OPENCL_PLATFORM", args.cl_platform)

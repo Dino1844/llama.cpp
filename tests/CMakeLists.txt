@@ -182,6 +182,7 @@ set(LLAMA_CONTEXT_TEST_SRC
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 
 llama_build_and_test(test-moe-window.cpp ${PROJECT_SOURCE_DIR}/src/llama-moe-window.cpp LABEL behavior LINK Threads::Threads)
+llama_build_and_test(test-htp-moe-pacing.cpp LABEL behavior LINK Threads::Threads ggml-base)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

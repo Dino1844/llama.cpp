@@ -34,6 +34,7 @@ public:
 
     using prefetch_load = std::function<void(int32_t, llama_moe_window_fill)>;
     using demand_load = std::function<void(int32_t, const std::vector<llama_moe_window_fill> &)>;
+    using defer_load = std::function<bool(const llama_moe_window_fill &)>;
 
     llama_moe_window(const std::vector<llama_moe_window_layer> & layers, int32_t depth, size_t threads,
                      prefetch_load prefetch, demand_load demand);
@@ -45,8 +46,10 @@ public:
     void disable_prefetch(int32_t layer);
 
     // Calls are serial within a batch. The scheduler makes routing inputs ready before resolving.
+    // The defer callback only registers the fill. If it accepts, finish_deferred must run before consuming the missing slot.
     void resolve(int32_t layer, const int32_t * ids, size_t count, int32_t * slots,
-                 const std::vector<int32_t> & near, const std::vector<int32_t> & far);
+                 const std::vector<int32_t> & near, const std::vector<int32_t> & far, const defer_load & defer = {});
+    void finish_deferred(const demand_load & load);
     llama_moe_window_stats stats() const;
 
 private:

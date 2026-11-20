@@ -243,6 +243,12 @@ struct llama_moe_window::impl {
 
     std::vector<llama_moe_window_fill> owned;
     std::vector<int32_t> joined;
+    struct {
+        int32_t layer = -1;
+        std::vector<int32_t> slots;
+        std::vector<int32_t> near;
+        std::vector<int32_t> far;
+    } deferred;
 
     impl(const std::vector<llama_moe_window_layer> & configs, int32_t depth, size_t threads,
             prefetch_load prefetch, demand_load demand) :
@@ -356,12 +362,14 @@ struct llama_moe_window::impl {
 
     void begin_batch() {
         std::lock_guard<std::mutex> lock(mutex);
+        cancel_deferred();
         ++epoch;
         cancel_queued([&](const job & j, const task &) { return j.epoch < epoch; });
     }
 
     void release_all() {
         std::lock_guard<std::mutex> lock(mutex);
+        cancel_deferred();
         for (auto & layer : layers) {
             layer.release();
         }
@@ -462,14 +470,14 @@ struct llama_moe_window::impl {
         }
     }
 
-    void demand_fill(int32_t il, window_layer & layer, std::unique_lock<std::mutex> & lock) {
+    void demand_fill(int32_t il, window_layer & layer, std::unique_lock<std::mutex> & lock, const demand_load & load) {
         if (owned.empty()) {
             return;
         }
         totals.demand += owned.size();
         lock.unlock();
         try {
-            demand(il, owned);
+            load(il, owned);
         } catch (...) {
             lock.lock();
             for (const auto & f : owned) {
@@ -485,8 +493,54 @@ struct llama_moe_window::impl {
         owned.clear();
     }
 
+    void cancel_deferred() {
+        if (deferred.layer >= 0) {
+            auto & layer = layers[deferred.layer];
+            const auto fill = owned.front();
+            layer.complete(fill, false);
+            layer.experts[fill.expert].pinned = false;
+            layer.selected.erase(std::find(layer.selected.begin(), layer.selected.end(), fill.expert));
+            owned.clear();
+            deferred.layer = -1;
+        }
+    }
+
+    void arm_predictions(int32_t il, const std::vector<int32_t> & near, const std::vector<int32_t> & far) {
+        if (!near.empty()) {
+            arm(il + 1, near, far.empty() ? prediction_stage::terminal : prediction_stage::near);
+        }
+        if (!far.empty()) {
+            arm(il + 2, far, il + 2 == last_window ? prediction_stage::terminal : prediction_stage::far);
+        }
+    }
+
+    void finish_deferred(const demand_load & load) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (deferred.layer < 0) {
+            throw std::logic_error("no deferred MoE window fill");
+        }
+        if (!load) {
+            throw std::invalid_argument("missing deferred MoE window loader");
+        }
+        const int32_t il = std::exchange(deferred.layer, -1);
+        auto & layer = layers[il];
+        try {
+            demand_fill(il, layer, lock, load);
+            arm_predictions(il, deferred.near, deferred.far);
+            for (int32_t slot : deferred.slots) {
+                layer.slots[slot].age = ++layer.clock;
+            }
+        } catch (...) {
+            // An HTP batch can still be using the pinned slots.
+            work_ready.notify_all();
+            throw;
+        }
+        lock.unlock();
+        work_ready.notify_all();
+    }
+
     void resolve(int32_t il, const int32_t * ids, size_t count, int32_t * slots,
-                 const std::vector<int32_t> & near, const std::vector<int32_t> & far) {
+                 const std::vector<int32_t> & near, const std::vector<int32_t> & far, const defer_load & defer) {
         auto & layer = layers.at(il);
         if (layer.slots.empty()) {
             throw std::logic_error("disabled MoE window");
@@ -500,6 +554,9 @@ struct llama_moe_window::impl {
         std::unique_lock<std::mutex> lock(mutex);
         if (epoch == 0) {
             throw std::logic_error("MoE window batch was not started");
+        }
+        if (deferred.layer >= 0) {
+            throw std::logic_error("previous MoE window fill is still deferred");
         }
         cancel_queued([&](const job & j, const task &) {
             return j.epoch < epoch || (j.epoch == epoch && j.layer <= il);
@@ -535,7 +592,20 @@ struct llama_moe_window::impl {
                     owned.push_back({ id, s });
                 }
             }
-            demand_fill(il, layer, lock);
+            if (defer && owned.size() == 1 && joined.empty() && layer.selected.size() > 1) {
+                deferred.slots.resize(count);
+                deferred.near = near;
+                deferred.far = far;
+                if (defer(owned.front())) {
+                    for (size_t i = 0; i < count; ++i) {
+                        slots[i] = layer.experts[ids[i]].slot;
+                        deferred.slots[i] = slots[i];
+                    }
+                    deferred.layer = il;
+                    return;
+                }
+            }
+            demand_fill(il, layer, lock, demand);
             // Dispatch all owned reads first. Only wait for selected prefetches.
             for (int32_t id : joined) {
                 auto & e = layer.experts[id];
@@ -548,14 +618,8 @@ struct llama_moe_window::impl {
                     owned.push_back({ id, s });
                 }
             }
-            demand_fill(il, layer, lock);
-
-            if (!near.empty()) {
-                arm(il + 1, near, far.empty() ? prediction_stage::terminal : prediction_stage::near);
-            }
-            if (!far.empty()) {
-                arm(il + 2, far, il + 2 == last_window ? prediction_stage::terminal : prediction_stage::far);
-            }
+            demand_fill(il, layer, lock, demand);
+            arm_predictions(il, near, far);
             for (size_t i = 0; i < count; ++i) {
                 const int32_t s = layer.experts[ids[i]].slot;
                 slots[i] = s;
@@ -594,8 +658,12 @@ void llama_moe_window::disable_prefetch(int32_t layer) {
 }
 
 void llama_moe_window::resolve(int32_t layer, const int32_t * ids, size_t count, int32_t * slots,
-        const std::vector<int32_t> & near, const std::vector<int32_t> & far) {
-    pimpl->resolve(layer, ids, count, slots, near, far);
+        const std::vector<int32_t> & near, const std::vector<int32_t> & far, const defer_load & defer) {
+    pimpl->resolve(layer, ids, count, slots, near, far, defer);
+}
+
+void llama_moe_window::finish_deferred(const demand_load & load) {
+    pimpl->finish_deferred(load);
 }
 
 llama_moe_window_stats llama_moe_window::stats() const {

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 struct prefetch_gate {
@@ -171,6 +172,112 @@ static void test_prefetch_failure(testing & t) {
     t.assert_equal("failed layer queues no further prefetch", before.far_queued, window.stats().far_queued);
 }
 
+static void test_deferred_completion(testing & t) {
+    std::array<int32_t, 2> weights = {-1, -1};
+    auto load = [&](int32_t, const auto & fills) {
+        for (const auto & fill : fills) {
+            weights[fill.slot] = fill.expert;
+        }
+    };
+    llama_moe_window window({{8, 2}, {8, 2}}, 1, 1, [](int32_t, auto) {}, load);
+    const std::array<int32_t, 4> ids = {1, 2, 2, 1};
+    std::array<int32_t, 4> slots;
+    window.begin_batch();
+    window.resolve(0, ids.data(), 1, slots.data(), {}, {});
+    const int32_t hit = slots[0];
+    window.release_all();
+    window.begin_batch();
+
+    llama_moe_window_fill offered = {-1, -1};
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {3}, {}, [&](const auto & fill) {
+        offered = fill;
+        return true;
+    });
+    t.assert_equal("offer the distinct miss", 2, offered.expert);
+    t.assert_equal("publish the reserved slot in each missing lane", offered.slot, slots[1]);
+    t.assert_equal(slots[1], slots[2]);
+    t.assert_equal(hit, slots[3]);
+    t.assert_equal("keep the demand idle until dispatch", size_t(1), window.stats().demand);
+    t.assert_equal("start predictions after the fill", size_t(0), window.stats().far_queued);
+    if (!t.assert_true("valid reserved slot", offered.slot >= 0 && offered.slot < int32_t(weights.size()))) {
+        return;
+    }
+    t.assert_equal(-1, weights[offered.slot]);
+
+    const auto caller = std::this_thread::get_id();
+    window.finish_deferred([&](int32_t layer, const auto & fills) {
+        t.assert_true("fill on the caller thread", std::this_thread::get_id() == caller);
+        t.assert_equal(0, layer);
+        t.assert_equal(size_t(1), fills.size());
+        load(layer, fills);
+    });
+    t.assert_equal(2, weights[offered.slot]);
+    t.assert_equal(size_t(2), window.stats().demand);
+    t.assert_equal(size_t(1), window.stats().far_queued);
+
+    window.release_all();
+    window.begin_batch();
+    const int32_t new_id = 4;
+    window.resolve(0, &new_id, 1, slots.data(), {}, {});
+    t.assert_equal("the final hit stays younger than the miss", offered.slot, slots[0]);
+}
+
+static void test_deferred_decline(testing & t) {
+    size_t offers = 0;
+    auto defer = [&](const auto &) {
+        ++offers;
+        return false;
+    };
+    llama_moe_window window({{8, 2}}, 0, 0, {}, [](int32_t, const auto &) {});
+    std::array<int32_t, 2> ids = {1, 2}, slots;
+    window.begin_batch();
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {}, defer);
+    t.assert_equal("multiple misses take the synchronous path", size_t(0), offers);
+    window.release_all();
+    window.begin_batch();
+    ids = {2, 3};
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {}, defer);
+    t.assert_equal(size_t(1), offers);
+    t.assert_equal("decline loads the miss synchronously", size_t(3), window.stats().demand);
+}
+
+static void test_deferred_cleanup(testing & t) {
+    auto load = [](int32_t, const auto &) {};
+    auto defer = [](const auto &) { return true; };
+    llama_moe_window window({{8, 2}}, 0, 0, {}, load);
+    std::array<int32_t, 2> ids = {1, 2}, slots;
+    window.begin_batch();
+    window.resolve(0, ids.data(), 1, slots.data(), {}, {});
+    const int32_t hit = slots[0];
+    window.release_all();
+    window.begin_batch();
+
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {}, defer);
+    bool failed = false;
+    try {
+        window.finish_deferred([](int32_t, const auto &) { throw std::runtime_error("read failed"); });
+    } catch (const std::runtime_error &) {
+        failed = true;
+    }
+    t.assert_true("report deferred load failure", failed);
+    window.release_all();
+    window.begin_batch();
+
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {}, defer);
+    window.begin_batch();
+    window.resolve(0, ids.data(), 1, slots.data(), {}, {});
+    t.assert_equal("cancelled demand can be omitted in the next batch", size_t(2), window.stats().demand);
+    window.release_all();
+    window.begin_batch();
+
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {}, defer);
+    window.release_all();
+    window.begin_batch();
+    window.resolve(0, ids.data(), ids.size(), slots.data(), {}, {});
+    t.assert_equal("retry the missing expert after cancellation", size_t(3), window.stats().demand);
+    t.assert_equal("retain the original hit", hit, slots[0]);
+}
+
 int main() {
     testing t;
     t.test("depth_zero", test_depth_zero);
@@ -178,5 +285,8 @@ int main() {
     t.test("terminal_budget", test_terminal_budget);
     t.test("disable_prefetch", test_disable_prefetch);
     t.test("prefetch_failure", test_prefetch_failure);
+    t.test("deferred_completion", test_deferred_completion);
+    t.test("deferred_decline", test_deferred_decline);
+    t.test("deferred_cleanup", test_deferred_cleanup);
     return t.summary();
 }

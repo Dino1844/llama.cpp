@@ -34,8 +34,8 @@ public:
     bool add_layer(int32_t layer, const std::vector<llama_moe_packed_tensor> & tensors, bool compact_q3k);
     using completion = std::function<void(size_t miss, const uint8_t * record, const std::vector<size_t> & family_offsets)>;
 
-    // Independent lookahead workers use their own aligned scratch and the same validated files.
-    void read_one(int32_t layer, int32_t expert, const completion & on_complete,
+    // Read and validate one record on the calling thread. Returns the record size.
+    size_t read_one(int32_t layer, int32_t expert, const completion & on_complete,
                     llama_moe_packed_timing * timing = nullptr) const;
 
     // One controlling thread must join each batch before starting another or destroying the reader.

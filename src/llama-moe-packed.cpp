@@ -403,7 +403,7 @@ struct llama_moe_packed::impl {
         }
     }
 
-    void read_one(int32_t il, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
+    size_t read_one(int32_t il, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
         const auto & layer = *layers.at(il);
         if (expert < 0 || static_cast<size_t>(expert) >= layer.checksums.size()) {
             throw std::out_of_range("invalid packed expert ID");
@@ -412,6 +412,7 @@ struct llama_moe_packed::impl {
         scratch.reserve(layer.stride);
         packed_read_expert(layer, scratch.data(), expert, timing);
         on_complete(0, scratch.data(), layer.family_offsets);
+        return layer.stride;
     }
 
     const char * layout() const {
@@ -535,7 +536,7 @@ struct llama_moe_packed::impl {
     }
 
     const char * layout() const { return ""; }
-    void read_one(int32_t, int32_t, const completion &, llama_moe_packed_timing *) const {
+    size_t read_one(int32_t, int32_t, const completion &, llama_moe_packed_timing *) const {
         throw std::runtime_error("packed experts require O_DIRECT support");
     }
     bool add_layer(int32_t, const std::vector<llama_moe_packed_tensor> &, bool) { return false; }
@@ -558,8 +559,8 @@ bool llama_moe_packed::add_layer(int32_t layer, const std::vector<llama_moe_pack
     return pimpl->add_layer(layer, tensors, compact_q3k);
 }
 
-void llama_moe_packed::read_one(int32_t layer, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
-    pimpl->read_one(layer, expert, on_complete, timing);
+size_t llama_moe_packed::read_one(int32_t layer, int32_t expert, const completion & on_complete, llama_moe_packed_timing * timing) const {
+    return pimpl->read_one(layer, expert, on_complete, timing);
 }
 
 void llama_moe_packed::start_async(int32_t layer, const std::vector<int32_t> & experts, completion on_complete,

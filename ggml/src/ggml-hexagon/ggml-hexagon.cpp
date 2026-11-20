@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include <atomic>
+#include <array>
 #include <memory>
 #include <chrono>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <utility>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -62,6 +64,7 @@
 #include "htp-common.h"
 #include "htp-kparams.h"
 #include "htp-fusion.h"
+#include "htp-moe-pacing.h"
 
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
@@ -304,6 +307,13 @@ struct ggml_hexagon_event {
     uint32_t               seq          = 0;
 };
 
+struct ggml_hexagon_moe_fill {
+    const ggml_tensor * bank = nullptr;
+    int32_t slot = -1;
+    bool (* load)(void *) = nullptr;
+    void * data = nullptr;
+};
+
 struct ggml_hexagon_session {
     std::string      name;
     remote_handle64  handle;
@@ -339,6 +349,15 @@ struct ggml_hexagon_session {
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
+
+    ggml_hexagon_moe_fill moe_fill;
+    ggml_backend_buffer_t moe_scratch = nullptr;
+    htp_moe_pacer moe_pacer;
+    size_t moe_overlapped = 0;
+    size_t moe_fallback = 0;
+    size_t moe_paceable = 0;
+    size_t moe_held = 0;
+    uint64_t moe_hold_ns = 0;
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -405,10 +424,11 @@ struct ggml_hexagon_session {
 
     void start_batch();
     void flush_sync(bool all = true);
-    void flush_async();
-    void flush_batch(size_t min_ops = 1);
+    void flush_async(bool pace_moe_hits = false);
+    void flush_batch(size_t min_ops = 1, bool pace_moe_hits = false);
     void flush_peers();
     void flush_pending(bool all = true);
+    void finish_moe_pacing();
 
     void mmap_buffers();
     void clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -1624,13 +1644,16 @@ struct ggml_hexagon_opbatch {
         return ti;
     }
 
-    bool fit_tensors(const htp_opnode & node, const ggml_tensor * expert_ready) const {
+    bool fit_tensors(const htp_opnode & node, const ggml_tensor * expert_ready, bool empty_batch = false) const {
         // check how much extras we will need
         size_t extra_bufs = 0;
         size_t extra_vmem = 0;
         size_t extra_tens = 0;
 
-        const bool check_tens = (n_tens + node.inputs.size() + node.outputs.size() + (expert_ready != nullptr)) > n_tens_max;
+        const unsigned int base_bufs = empty_batch ? 0 : n_bufs;
+        const unsigned int base_tens = empty_batch ? 0 : n_tens;
+        const size_t base_vmem = empty_batch ? 0 : b_vmem;
+        const bool check_tens = (base_tens + node.inputs.size() + node.outputs.size() + (expert_ready != nullptr)) > n_tens_max;
 
         int seen_bufs[HTP_OP_MAX_BUFS];
         int n_seen_bufs = 0;
@@ -1641,20 +1664,22 @@ struct ggml_hexagon_opbatch {
             if (check_tens) {
                 htp_tensor shape {};
                 init_tensor_shape(shape, t);
-                if (t_map.count(hash_tensor(t, shape))) return;
+                if (!empty_batch && t_map.count(hash_tensor(t, shape))) return;
                 extra_tens++;
             }
 
             auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
             int fd = sbuf->fd();
-            if (find_buffer(fd) < 0) {
+            if (empty_batch || find_buffer(fd) < 0) {
                 for (int i = 0; i < n_seen_bufs; i++) {
                     if (seen_bufs[i] == fd) return;
                 }
                 if (n_seen_bufs < HTP_OP_MAX_BUFS) {
                     seen_bufs[n_seen_bufs++] = fd;
                 }
-                if (!sbuf->extended) {
+                const bool extended = sbuf->extended ||
+                    (empty_batch && opt_dma64 && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                if (!extended) {
                     extra_vmem += sbuf->size();
                 }
                 extra_bufs += 1;
@@ -1669,9 +1694,9 @@ struct ggml_hexagon_opbatch {
         }
         fit_tensor(expert_ready);
 
-        if ((extra_bufs + n_bufs) > n_bufs_max) return false;
-        if (check_tens && (extra_tens + n_tens) > n_tens_max) return false;
-        if ((extra_vmem + b_vmem) > b_vmem_max) return false;
+        if ((extra_bufs + base_bufs) > n_bufs_max) return false;
+        if (check_tens && (extra_tens + base_tens) > n_tens_max) return false;
+        if ((extra_vmem + base_vmem) > b_vmem_max) return false;
 
         return true;
     }
@@ -1962,9 +1987,9 @@ void ggml_hexagon_session::flush_peers() {
     }
 }
 
-void ggml_hexagon_session::flush_async() {
+void ggml_hexagon_session::flush_async(bool pace_moe_hits) {
     flush_peers();
-    flush_batch();
+    flush_batch(1, pace_moe_hits);
 }
 
 void ggml_hexagon_session::flush_pending(bool all) {
@@ -2017,7 +2042,19 @@ void ggml_hexagon_session::flush_pending(bool all) {
     }
 }
 
+void ggml_hexagon_session::finish_moe_pacing() {
+    if (!moe_pacer.enabled()) {
+        return;
+    }
+    const int64_t hold_ns = moe_pacer.finish();
+    if (hold_ns > 0) {
+        ++moe_held;
+        moe_hold_ns += hold_ns;
+    }
+}
+
 void ggml_hexagon_session::flush_sync(bool all) {
+    finish_moe_pacing();
     flush_async();
     flush_pending(all);
 }
@@ -2028,7 +2065,7 @@ void ggml_hexagon_session::start_batch() {
     }
 }
 
-void ggml_hexagon_session::flush_batch(size_t min_ops) {
+void ggml_hexagon_session::flush_batch(size_t min_ops, bool pace_moe_hits) {
     if (op_batch->n_ops < min_ops) { return; }
 
     op_batch->sort_buffers();
@@ -2068,9 +2105,22 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
-    int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
-    if (err != 0) {
-        GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
+    auto send = [this, dbuf, req]() mutable {
+        const int err = dspqueue_write(queue, 0, 1, &dbuf, sizeof(req), (const uint8_t *) &req, DSPQUEUE_TIMEOUT);
+        if (err != 0) {
+            GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", c_name(), (unsigned) err);
+        }
+    };
+    bool scheduled = false;
+    if (pace_moe_hits) {
+        try {
+            scheduled = moe_pacer.submit(send);
+        } catch (const std::exception &) {
+            // A reserved queue entry still needs to be sent if pacing fails.
+        }
+    }
+    if (!scheduled) {
+        send();
     }
 
     op_batch->reset();
@@ -2603,6 +2653,11 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
+    finish_moe_pacing();
+    if (moe_overlapped || moe_fallback) {
+        GGML_LOG_INFO("ggml-hex: %s moe overlap: layers=%zu fallback=%zu held=%zu hold_ns=%" PRIu64 " paceable=%zu\n",
+                c_name(), moe_overlapped, moe_fallback, moe_held, moe_hold_ns, moe_paceable);
+    }
     this->mdev.sessions.clear();
 
     int err;
@@ -2614,6 +2669,9 @@ void ggml_hexagon_session::release() noexcept(true) {
             GGML_ABORT("ggml-hex: htp_iface_stop failed: 0x%08x\n", (unsigned) err);
         }
     }
+
+    ggml_backend_buffer_free(moe_scratch);
+    moe_scratch = nullptr;
 
     for (auto & it : this->cpy_fence_slots) {
         free_fence((void *) it.second, 1);
@@ -2733,6 +2791,213 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
     }
 }
 
+static int64_t ggml_hexagon_moe_rank(const ggml_cgraph * graph, const htp_opnode * ops, const ggml_hexagon_moe_fill & fill) {
+    if (ops[0].opcode != HTP_OP_MUL_MAT_ID || ops[1].opcode != HTP_OP_MUL_MAT_ID ||
+            ops[2].opcode != HTP_OP_GLU_SWIGLU || ops[3].opcode != HTP_OP_MUL_MAT_ID) {
+        return -1;
+    }
+
+    const auto * up = ops[0].node;
+    const auto * gate = ops[1].node;
+    const auto * activation = ops[2].node;
+    const auto * down = ops[3].node;
+    const auto * slots = down->src[2];
+    const auto * input = up->src[1];
+    const int64_t ranks = down->ne[1];
+    if (down->src[0] != fill.bank || down->src[1] != activation || gate->src[1] != input ||
+            up->src[2] != slots || gate->src[2] != slots || !input || input->ne[1] != 1 ||
+            input->ne[2] != 1 || input->ne[3] != 1 || ranks < 2 ||
+            !slots || !slots->data || slots->type != GGML_TYPE_I32 || slots->op != GGML_OP_NONE ||
+            slots->ne[0] != ranks || slots->ne[1] != 1 || slots->ne[2] != 1 || slots->ne[3] != 1 ||
+            !ggml_is_contiguous(slots)) {
+        return -1;
+    }
+    if (!((activation->src[0] == up && activation->src[1] == gate) ||
+          (activation->src[0] == gate && activation->src[1] == up))) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < 4; ++i) {
+        const auto * t = ops[i].node;
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+                t->ne[1] != ranks || t->ne[2] != 1 || t->ne[3] != 1) {
+            return -1;
+        }
+        if (i < 3) {
+            const auto * at = std::find(graph->nodes, graph->nodes + graph->n_nodes, t);
+            if (at == graph->nodes + graph->n_nodes ||
+                    !ggml_node_has_n_uses(graph, at - graph->nodes, 1)) {
+                return -1;
+            }
+        }
+    }
+
+    // The input copy from the host slot lookup has completed before graph dispatch.
+    const auto * ids = static_cast<const int32_t *>(slots->data);
+    const auto * missing = std::find(ids, ids + ranks, fill.slot);
+    if (missing == ids + ranks || std::find(missing + 1, ids + ranks, fill.slot) != ids + ranks) {
+        return -1;
+    }
+    return missing - ids;
+}
+
+static bool ggml_hexagon_slice_moe(ggml_hexagon_session * sess, const htp_opnode * chain, int64_t rank,
+        std::array<std::vector<htp_opnode>, 3> & phases, htp_opnode & copy) {
+    auto buft = ggml_backend_dev_buffer_type(sess->dev);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t bytes = 0;
+    std::array<size_t, 4> offsets{};
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        const size_t size = ggml_nbytes(chain[i].node);
+        if (size > SIZE_MAX - (alignment - 1) || GGML_PAD(size, alignment) > SIZE_MAX - bytes) {
+            return false;
+        }
+        offsets[i] = bytes;
+        bytes += GGML_PAD(size, alignment);
+    }
+    if (!sess->moe_scratch || ggml_backend_buffer_get_size(sess->moe_scratch) < bytes) {
+        auto * buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+        if (!buffer) {
+            return false;
+        }
+        if (sess->moe_scratch) {
+            sess->flush_sync();
+            ggml_backend_buffer_free(sess->moe_scratch);
+        }
+        sess->moe_scratch = buffer;
+    }
+
+    const auto * output = chain[3].node;
+    const auto * slots = output->src[2];
+    const std::array<int64_t, 3> first{0, rank + 1, rank};
+    const std::array<int64_t, 3> count{rank, output->ne[1] - rank - 1, 1};
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(sess->moe_scratch));
+    for (size_t phase = 0; phase < phases.size(); ++phase) {
+        if (!count[phase]) {
+            continue;
+        }
+
+        auto metadata = std::make_shared<std::array<ggml_tensor, 5>>();
+        auto & ids = metadata->back();
+        ids = *slots;
+        ids.ne[0] = count[phase];
+        ids.data = static_cast<uint8_t *>(ids.data) + first[phase] * ids.nb[0];
+        phases[phase].reserve(offsets.size());
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            auto & t = (*metadata)[i];
+            t = *chain[i].node;
+            t.ne[1] = count[phase];
+            t.data = base + offsets[i] + first[phase] * t.nb[1];
+            t.buffer = sess->moe_scratch;
+            t.view_src = nullptr;
+            t.view_offs = 0;
+            auto & op = phases[phase].emplace_back(chain[i].opcode);
+            op.dummy.emplace_back(metadata, &t);
+            for (auto & src : t.src) {
+                if (src == slots) {
+                    src = &ids;
+                }
+                for (size_t j = 0; j < i; ++j) {
+                    if (src == chain[j].node) {
+                        src = &(*metadata)[j];
+                    }
+                }
+            }
+            op.init(&t);
+            if (!htp_kparams_solve(sess, op) || !sess->op_batch->fit_tensors(op, nullptr, true)) {
+                return false;
+            }
+            if (op.opcode == HTP_OP_MUL_MAT_ID) {
+                const auto * original = chain[i].kparams<htp_mm_kernel_params>();
+                const auto * sliced   = op.kparams<htp_mm_kernel_params>();
+                if (original->kernel_type != sliced->kernel_type || original->n_hmx != sliced->n_hmx) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Separate scratch prevents allocator aliases from overlapping the other ranks.
+    auto * src = copy.add_dummy(*output);
+    src->data = base + offsets.back();
+    src->buffer = sess->moe_scratch;
+    src->view_src = nullptr;
+    src->view_offs = 0;
+    auto * dst = copy.add_dummy(*output);
+    dst->op = GGML_OP_CPY;
+    std::fill(std::begin(dst->src), std::end(dst->src), nullptr);
+    dst->src[0] = src;
+    copy.init(dst);
+    return htp_kparams_solve(sess, copy) && sess->op_batch->fit_tensors(copy, nullptr, true);
+}
+
+static ggml_status ggml_hexagon_submit_moe(ggml_hexagon_session * sess, const ggml_cgraph * graph,
+        const std::vector<htp_opnode> & nodes) {
+    const auto fill = std::exchange(sess->moe_fill, {});
+    for (size_t i = 0; i + 3 < nodes.size(); ++i) {
+        const int64_t rank = ggml_hexagon_moe_rank(graph, &nodes[i], fill);
+        if (rank < 0) {
+            continue;
+        }
+        std::array<std::vector<htp_opnode>, 3> phases;
+        htp_opnode copy(HTP_OP_CPY);
+        if (!ggml_hexagon_slice_moe(sess, &nodes[i], rank, phases, copy)) {
+            break;
+        }
+
+        const uint64_t seq = sess->batch_req_seq;
+        const bool isolated = i == 0 && sess->op_batch->empty() && seq == sess->batch_rsp_seq &&
+                sess->virt_peers.empty() && sess->phys_peers.empty();
+        for (size_t j = 0; j < i; ++j) {
+            sess->enqueue_op(nodes[j]);
+        }
+        for (size_t phase = 0; phase < 2; ++phase) {
+            for (const auto & op : phases[phase]) {
+                sess->enqueue_op(op);
+            }
+        }
+        const bool paceable = isolated && sess->batch_req_seq == seq;
+        sess->moe_paceable += paceable;
+        const bool pace = paceable && sess->moe_pacer.enabled();
+        const uint64_t hold_before = sess->moe_hold_ns;
+        sess->flush_async(pace);
+        const uint64_t hit_seq = sess->batch_req_seq;
+        const int64_t read_begin = opt_profile ? ggml_time_us() : 0;
+        const bool loaded = fill.load(fill.data);
+        const int64_t read_end = opt_profile ? ggml_time_us() : 0;
+        if (pace) {
+            sess->finish_moe_pacing();
+        }
+        if (opt_profile) {
+            GGML_LOG_INFO("ggml-hex: %s moe overlap: seq=%" PRIu64 "..%" PRIu64 " read_begin_us=%" PRId64
+                          " read_end_us=%" PRId64 " hold_ns=%" PRIu64 "\n", sess->c_name(), seq + 1,
+                    hit_seq, read_begin, read_end, sess->moe_hold_ns - hold_before);
+        }
+        if (!loaded || sess->last_error > HTP_STATUS_OK) {
+            sess->flush_sync();
+            return GGML_STATUS_FAILED;
+        }
+        for (const auto & op : phases[2]) {
+            sess->enqueue_op(op);
+        }
+        sess->enqueue_op(copy);
+        for (size_t j = i + 4; j < nodes.size(); ++j) {
+            sess->enqueue_op(nodes[j]);
+        }
+        ++sess->moe_overlapped;
+        return GGML_STATUS_SUCCESS;
+    }
+
+    ++sess->moe_fallback;
+    if (!fill.load(fill.data)) {
+        return GGML_STATUS_FAILED;
+    }
+    for (const auto & node : nodes) {
+        sess->enqueue_op(node);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -2781,8 +3046,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-    for (const auto & node : *nodes_ptr) {
-        sess->enqueue_op(node);
+    if (sess->moe_fill.load) {
+        const auto status = ggml_hexagon_submit_moe(sess, graph, *nodes_ptr);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    } else {
+        for (const auto & node : *nodes_ptr) {
+            sess->enqueue_op(node);
+        }
     }
 
     if (sess->last_error > HTP_STATUS_OK) {
@@ -3640,6 +3912,30 @@ static uint32_t * ggml_backend_hexagon_set_expert_ready(
     return static_cast<uint32_t *>(data);
 }
 
+static bool ggml_backend_hexagon_defer_moe_fill(ggml_backend_t backend, const ggml_tensor * bank, int32_t slot,
+        bool (*load)(void *), void * data) {
+    if (!ggml_backend_is_hexagon(backend)) {
+        return false;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (!bank) {
+        sess->moe_fill = {};
+        return true;
+    }
+    if (!load || sess->moe_fill.load || sess->mdev.count != 1 || !sess->expert_ready_banks.empty() ||
+            slot < 0 || slot >= bank->ne[2] || !bank->buffer || !bank->data ||
+            bank->buffer->iface.free_buffer != ggml_backend_hexagon_buffer_free_buffer ||
+            !ggml_hexagon_tensor_is_tiled(bank)) {
+        return false;
+    }
+    const auto * buffer = static_cast<const ggml_hexagon_shared_buffer *>(bank->buffer->context);
+    if (buffer->sess != sess) {
+        return false;
+    }
+    sess->moe_fill = {bank, slot, load, data};
+    return true;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -3675,6 +3971,9 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_hexagon_set_expert_ready") == 0) {
         return (void *) ggml_backend_hexagon_set_expert_ready;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_defer_moe_fill") == 0) {
+        return (void *) ggml_backend_hexagon_defer_moe_fill;
     }
     return NULL;
 }

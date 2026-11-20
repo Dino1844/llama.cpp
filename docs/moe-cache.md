@@ -46,7 +46,17 @@ On a miss the reader uses one aligned read per expert and checks the record's CR
 
 `LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches use a separate shared bank. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). With no layout specified, positive depth selects windows and zero depth selects the shared cache. Set `LLAMA_MOE_CACHE_LAYOUT=window` in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout` and `--moe-cache-prefetch`.
 
-The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. The CPU publishes the slot IDs after all selected reads complete, and the scheduler keeps the slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
+The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. The scheduler keeps the selected slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
+
+`LLAMA_MOE_CACHE_OVERLAP=1` enables foreground single-miss overlap on supported Hexagon MoE graphs in window mode. The slot lookup reserves the missing slot. The backend submits the resident experts, then reads, checks and fills the reserved slot on the inference thread before submitting the remaining expert. Unsupported batches use the full-graph path. The Snapdragon runner passes these options with `--moe-cache-overlap 1` and `--hex-moe-pacing-file PATH`.
+
+Set `GGML_HEXAGON_MOE_PACING_FILE` to supply an optional protection interval for the first Hexagon batch. An external controller can atomically replace the file with one line of six integers in nanoseconds:
+
+```text
+anchor_ns period_ns protected_ns batch_ns max_hold_ns expires_ns
+```
+
+`anchor_ns` is a period-aligned start of a protected interval on the host monotonic clock. `batch_ns` is the estimated time from submission to completion of the hit batch. A hit batch that would overlap a protected interval can wait until the end of that interval if it fits the hold budget. The missing expert read proceeds during the hold. Early read completion releases the held dispatch. An expired, missing or malformed file disables holds. Keep this option off to measure the overlap path without pacing.
 
 `LLAMA_MOE_CACHE_PROFILE=1` reports `pread`, CRC and upload timings. The worker sums can overlap. Demand wait includes scheduling and all three stages. The prefetch wait field sums worker elapsed time without implying a stall in inference. CRC CPU time excludes time when the worker is descheduled. `LLAMA_MOE_CACHE_TRACE` also records routed expert IDs and physical slot sizes. The tuning script simulates the shared cache policy.
 
