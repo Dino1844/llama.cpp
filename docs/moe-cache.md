@@ -1,6 +1,6 @@
 # MoE cache
 
-When the experts of MoE layers stay in host memory (`-cmoe`, `-ncmoe`, `-ot`), the MoE cache keeps the most used ones in device memory for small batches (decode, speculative decoding). Large batches still upload the experts they use.
+When the experts of MoE layers stay in host memory (`-cmoe`, `-ncmoe`, `-ot`), the MoE cache keeps active experts in device memory. By default, compatible layers share an LRU cache that can reuse resident experts across prefill and decode batches.
 
 | Argument | |
 |---|---|
@@ -44,16 +44,16 @@ On a miss the reader uses one aligned read per expert and checks the record's CR
 
 `GGML_HEXAGON_MOE_HMX_PIPELINE=1` enables the routed HMX pipeline when the tensor shape and VTCM budget permit it. `GGML_HEXAGON_MOE_HMX_MIN_ROWS` sets the minimum token rows for routed HMX, inclusive (default 5). For example, set it to 9 to use HVX for up to eight rows and allow HMX on larger batches. This threshold applies to routed matrix products. `LLAMA_MOE_CACHE_READY=1` lets eligible packed batches submit same-layer expert work while missing weights are read and verified. Enable routed HMX to compute experts as their slots are published. The HMX pipeline and readiness options default to off.
 
-`LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches use a separate shared bank that supports readiness with `LLAMA_MOE_CACHE_READY=1`. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). With no layout specified, positive depth selects windows and zero depth selects the shared cache. Set `LLAMA_MOE_CACHE_LAYOUT=window` in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout`, `--moe-cache-prefetch` and `--moe-cache-ready`.
+`LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches refill a temporary bank for each layer and microbatch. This bank supports readiness with `LLAMA_MOE_CACHE_READY=1`. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). A positive depth requires explicitly setting `LLAMA_MOE_CACHE_LAYOUT=window`. Use this layout in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout`, `--moe-cache-prefetch` and `--moe-cache-ready`.
 
 The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. New prefetch reads wait while the window fills demand misses. The scheduler keeps the selected slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
 
-The following settings combine the compact window cache for speculative verification with readiness and HMX for larger prefill batches. Use a compact expert pack made from the target GGUF.
+The following settings use the shared LRU cache with DSpark and enable readiness and HMX for eligible prefill batches. Use a compact expert pack made from the target GGUF.
 
 ```sh
 python3 scripts/snapdragon/run.py --hex-q3k-compact 1 --hex-moe-hmx-pipeline 1 --hex-moe-hmx-min-rows 9 \
-  --moe-cache-packed-dir /path/to/experts-htp-compact --moe-cache-layout window \
-  --moe-cache-prefetch 8 --moe-cache-io-threads 8 --moe-cache-ready 1 -- \
+  --moe-cache-packed-dir /path/to/experts-htp-compact --moe-cache-layout shared \
+  --moe-cache-prefetch 0 --moe-cache-io-threads 8 --moe-cache-ready 1 -- \
   llama-cli -m /path/to/model.gguf --device HTP0 -ngl 99 --cpu-moe \
   --load-mode mmap --no-host --fit off --moe-cache-mib 5100 -c 2048 -b 512 -ub 32 \
   --spec-type draft-dspark --model-draft /path/to/draft.gguf --device-draft HTP0 -ngld 99 --spec-draft-n-max 4

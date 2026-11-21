@@ -470,7 +470,7 @@ struct llama_moe_cache::impl {
             }
             prefetch_depth = static_cast<int32_t>(count);
         }
-        bool window_layout = prefetch_depth > 0;
+        bool window_layout = false;
         if (const char * value = std::getenv("LLAMA_MOE_CACHE_LAYOUT")) {
             window_layout = std::strcmp(value, "window") == 0;
             if (!window_layout && std::strcmp(value, "shared") != 0) {
@@ -478,7 +478,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (!window_layout && prefetch_depth > 0) {
-            throw std::runtime_error("MoE cache prefetch requires the window layout");
+            throw std::runtime_error("MoE cache prefetch requires LLAMA_MOE_CACHE_LAYOUT=window");
         }
         if (window_layout && (!pack_path || !*pack_path || this->cpu_share > 0.0f)) {
             throw std::runtime_error("MoE cache windows require packed experts and no CPU miss share");
