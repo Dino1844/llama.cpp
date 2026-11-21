@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <array>
+#include <cerrno>
+#include <climits>
 #include <memory>
 #include <chrono>
 #include <mutex>
@@ -137,6 +139,7 @@ size_t opt_mbuf_total  = 0;                        // total buffer space limit (
 
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 bool   opt_moe_hmx_pipeline = false;
+int    opt_moe_hmx_min_rows = HTP_MM_HMX_MIN_NROWS + 1;
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
 int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
@@ -320,6 +323,9 @@ struct ggml_hexagon_moe_stats {
     size_t paceable = 0;
     size_t held = 0;
     uint64_t hold_ns = 0;
+    size_t routed_paceable = 0;
+    size_t routed_held = 0;
+    uint64_t routed_hold_ns = 0;
 };
 
 struct ggml_hexagon_session {
@@ -429,7 +435,7 @@ struct ggml_hexagon_session {
     void start_batch();
     void flush_sync(bool all = true);
     void flush_async(bool pace_moe_hits = false);
-    void flush_batch(size_t min_ops = 1, bool pace_moe_hits = false);
+    void flush_batch(size_t min_ops = 1, bool pace_moe_hits = false, bool pace_routed = false);
     void flush_peers();
     void flush_pending(bool all = true);
     void finish_moe_pacing();
@@ -1521,6 +1527,24 @@ struct ggml_hexagon_opbatch {
     bool empty() const { return n_ops == 0; }
     bool full()  const { return n_ops >= n_ops_max; }
 
+    bool has_paceable_routed_work() const {
+        constexpr int64_t max_rows = 8;
+        bool multirow = false;
+        for (unsigned int i = 0; i < n_ops; ++i) {
+            const auto & op = ops[i];
+            if (op.opcode != HTP_OP_MUL_MAT_ID && op.opcode != HTP_OP_MUL_MAT_ID_NX) {
+                continue;
+            }
+            for (const auto * output : op.get_outputs()) {
+                if (output->ne[2] < 1 || output->ne[2] > max_rows || output->ne[3] != 1) {
+                    return false;
+                }
+                multirow |= output->ne[2] > 1;
+            }
+        }
+        return multirow;
+    }
+
     int find_buffer(int fd) const {
         for (unsigned int i = 0; i < n_bufs; i++) {
             if ((int) h_bufs[i].fd == fd) {
@@ -1992,8 +2016,10 @@ void ggml_hexagon_session::flush_peers() {
 }
 
 void ggml_hexagon_session::flush_async(bool pace_moe_hits) {
+    const bool pace_routed = moe_pacer.enabled() && !pace_moe_hits && !moe_fill.load && mdev.count == 1 &&
+            virt_peers.empty() && phys_peers.empty() && batch_req_seq == batch_rsp_seq;
     flush_peers();
-    flush_batch(1, pace_moe_hits);
+    flush_batch(1, pace_moe_hits, pace_routed);
 }
 
 void ggml_hexagon_session::flush_pending(bool all) {
@@ -2069,11 +2095,24 @@ void ggml_hexagon_session::start_batch() {
     }
 }
 
-void ggml_hexagon_session::flush_batch(size_t min_ops, bool pace_moe_hits) {
+void ggml_hexagon_session::flush_batch(size_t min_ops, bool pace_moe_hits, bool pace_routed) {
     if (op_batch->n_ops < min_ops) { return; }
 
     op_batch->sort_buffers();
     this->mmap_buffers();
+
+    if (pace_routed && op_batch->has_paceable_routed_work()) {
+        ++moe_stats.routed_paceable;
+        try {
+            const int64_t held_ns = moe_pacer.pause();
+            if (held_ns > 0) {
+                ++moe_stats.routed_held;
+                moe_stats.routed_hold_ns += held_ns;
+            }
+        } catch (const std::exception &) {
+            // Optional pacing must not prevent submission.
+        }
+    }
 
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
@@ -2765,6 +2804,10 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     if (stats.overlapped || stats.fallback || stats.held) {
         GGML_LOG_INFO("ggml-hex: %s moe overlap: layers=%zu fallback=%zu held=%zu hold_ns=%" PRIu64 " paceable=%zu\n",
                 sess->c_name(), stats.overlapped, stats.fallback, stats.held, stats.hold_ns, stats.paceable);
+    }
+    if (stats.routed_paceable) {
+        GGML_LOG_INFO("ggml-hex: %s moe routed pacing: batches=%zu held=%zu hold_ns=%" PRIu64 "\n",
+                sess->c_name(), stats.routed_paceable, stats.routed_held, stats.routed_hold_ns);
     }
     delete backend;
 }
@@ -4156,6 +4199,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_vtcm_size = getenv("GGML_HEXAGON_VTCM_SIZE");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_moe_hmx_pipeline = getenv("GGML_HEXAGON_MOE_HMX_PIPELINE");
+    const char * str_moe_hmx_min_rows = getenv("GGML_HEXAGON_MOE_HMX_MIN_ROWS");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
     const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
@@ -4226,6 +4270,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_vtcm_size = str_vtcm_size ? parse_size(str_vtcm_size)                 : opt_vtcm_size;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_moe_hmx_pipeline = str_moe_hmx_pipeline && std::strcmp(str_moe_hmx_pipeline, "1") == 0;
+    if (str_moe_hmx_min_rows) {
+        char * end = nullptr;
+        errno = 0;
+        const long value = std::strtol(str_moe_hmx_min_rows, &end, 10);
+        if (errno || end == str_moe_hmx_min_rows || *end || value <= HTP_MM_HMX_MIN_NROWS || value > INT_MAX) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_MOE_HMX_MIN_ROWS must be an integer in [%d, %d], using %d\n",
+                    HTP_MM_HMX_MIN_NROWS + 1, INT_MAX, opt_moe_hmx_min_rows);
+        } else {
+            opt_moe_hmx_min_rows = static_cast<int>(value);
+        }
+    }
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
     opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;

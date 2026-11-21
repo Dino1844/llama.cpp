@@ -70,17 +70,8 @@ public:
 
     // All calls except the send itself belong to the session's graph thread.
     bool submit(std::function<void()> send) {
-        if (!enabled()) {
-            return false;
-        }
-        const auto now = clock::now();
-        if (now >= refresh_at) {
-            refresh_at = now + std::chrono::milliseconds(50);
-            refresh();
-        }
-        const auto decision = clock::now();
-        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(decision.time_since_epoch()).count();
-        const int64_t hold_ns = protection.delay(now_ns);
+        auto decision = clock::now();
+        const int64_t hold_ns = delay(decision);
         if (!hold_ns) {
             return false;
         }
@@ -105,6 +96,17 @@ public:
         return true;
     }
 
+    // Keep intact routed packets on the graph thread to preserve queue order.
+    int64_t pause() {
+        auto decision = clock::now();
+        const int64_t hold_ns = delay(decision);
+        if (!hold_ns) {
+            return 0;
+        }
+        std::this_thread::sleep_until(decision + std::chrono::nanoseconds(hold_ns));
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - decision).count();
+    }
+
     // Release the hold at read completion.
     int64_t finish() {
         if (!worker.joinable()) {
@@ -118,6 +120,19 @@ public:
     }
 
 private:
+    int64_t delay(clock::time_point & now) {
+        if (!enabled()) {
+            return 0;
+        }
+        if (now >= refresh_at) {
+            refresh_at = now + std::chrono::milliseconds(50);
+            refresh();
+        }
+        now = clock::now();
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        return protection.delay(now_ns);
+    }
+
     void refresh() {
         protection = {};
         std::error_code error;

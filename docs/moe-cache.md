@@ -42,21 +42,32 @@ On a miss the reader uses one aligned read per expert and checks the record's CR
 
 `GGML_HEXAGON_Q3K_COMPACT=1` enables the compact layout for Q3_K expert banks. It requires matching DSP support. Add `--q3k-compact` when creating or verifying the packed directory for those banks. Other quantizations keep their existing layout.
 
-`GGML_HEXAGON_MOE_HMX_PIPELINE=1` enables the routed HMX pipeline when the tensor shape and VTCM budget permit it. `LLAMA_MOE_CACHE_READY=1` optionally lets eligible multi-row packed batches submit same-layer expert work while missing weights are read and verified. Both options default to off.
+`GGML_HEXAGON_MOE_HMX_PIPELINE=1` enables the routed HMX pipeline when the tensor shape and VTCM budget permit it. `GGML_HEXAGON_MOE_HMX_MIN_ROWS` sets the minimum token rows for routed HMX, inclusive (default 5). For example, set it to 9 to use HVX for up to eight rows and allow HMX on larger batches. This threshold applies to routed matrix products. `LLAMA_MOE_CACHE_READY=1` lets eligible packed batches submit same-layer expert work while missing weights are read and verified. Enable routed HMX to compute experts as their slots are published. The HMX pipeline and readiness options default to off.
 
-`LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches use a separate shared bank. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). With no layout specified, positive depth selects windows and zero depth selects the shared cache. Set `LLAMA_MOE_CACHE_LAYOUT=window` in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout` and `--moe-cache-prefetch`.
+`LLAMA_MOE_CACHE_LAYOUT=window` selects per-layer expert windows for batches up to eight rows, including speculative verification. Larger batches use a separate shared bank that supports readiness with `LLAMA_MOE_CACHE_READY=1`. `LLAMA_MOE_CACHE_PREFETCH=N` sets the per-layer prefetch budget (default 0, range 0-8). With no layout specified, positive depth selects windows and zero depth selects the shared cache. Set `LLAMA_MOE_CACHE_LAYOUT=window` in both runs when comparing prefetch depths at the same slot capacity. Window mode requires packed experts, enough cache for the windows, and a CPU miss share of zero. The Snapdragon runner exposes these settings as `--moe-cache-layout`, `--moe-cache-prefetch` and `--moe-cache-ready`.
 
-The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. The scheduler keeps the selected slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
+The router predicts experts two layers ahead and refines pending requests from the next prediction. Both predictions share the target layer's budget. Demand joins only in-progress reads for selected experts. New prefetch reads wait while the window fills demand misses. The scheduler keeps the selected slots pinned until the graph completes. `LLAMA_MOE_CACHE_IO_THREADS` sets the demand and prefetch pool sizes. Depth zero starts no prefetch workers.
+
+The following settings combine the compact window cache for speculative verification with readiness and HMX for larger prefill batches. Use a compact expert pack made from the target GGUF.
+
+```sh
+python3 scripts/snapdragon/run.py --hex-q3k-compact 1 --hex-moe-hmx-pipeline 1 --hex-moe-hmx-min-rows 9 \
+  --moe-cache-packed-dir /path/to/experts-htp-compact --moe-cache-layout window \
+  --moe-cache-prefetch 8 --moe-cache-io-threads 8 --moe-cache-ready 1 -- \
+  llama-cli -m /path/to/model.gguf --device HTP0 -ngl 99 --cpu-moe \
+  --load-mode mmap --no-host --fit off --moe-cache-mib 5100 -c 2048 -b 512 -ub 32 \
+  --spec-type draft-dspark --model-draft /path/to/draft.gguf --device-draft HTP0 -ngld 99 --spec-draft-n-max 4
+```
 
 `LLAMA_MOE_CACHE_OVERLAP=1` enables foreground single-miss overlap on supported Hexagon MoE graphs in window mode. The slot lookup reserves the missing slot. The backend submits the resident experts, then reads, checks and fills the reserved slot on the inference thread before submitting the remaining expert. Unsupported batches use the full-graph path. The Snapdragon runner passes these options with `--moe-cache-overlap 1` and `--hex-moe-pacing-file PATH`.
 
-Set `GGML_HEXAGON_MOE_PACING_FILE` to supply an optional protection interval for the first Hexagon batch. An external controller can atomically replace the file with one line of six integers in nanoseconds:
+Set `GGML_HEXAGON_MOE_PACING_FILE` to supply an optional protection interval for Hexagon submissions. An external controller can atomically replace the file with one line of six integers in nanoseconds:
 
 ```text
 anchor_ns period_ns protected_ns batch_ns max_hold_ns expires_ns
 ```
 
-`anchor_ns` is a period-aligned start of a protected interval on the host monotonic clock. `batch_ns` is the estimated time from submission to completion of the hit batch. A hit batch that would overlap a protected interval can wait until the end of that interval if it fits the hold budget. The missing expert read proceeds during the hold. Early read completion releases the held dispatch. An expired, missing or malformed file disables holds. Keep this option off to measure the overlap path without pacing.
+`anchor_ns` is a period-aligned start of a protected interval on the host monotonic clock. `batch_ns` estimates submission-to-completion time for the packet being paced. A packet that would overlap a protected interval can wait until the end of that interval if it fits the hold budget. With single-miss overlap, early read completion releases the held hit packet. Intact packets containing a small multi-row expert batch, including speculative verification, can also wait at an idle Hexagon queue. These packets retain their original operators and slot indices. Their hold may add decode latency because the demand read has already finished. Use an estimate for the complete packet when pacing verification. An expired, missing or malformed file disables holds. Unset the file for the baseline and use the same model settings in the paced run.
 
 `LLAMA_MOE_CACHE_PROFILE=1` reports `pread`, CRC and upload timings. The worker sums can overlap. Demand wait includes scheduling and all three stages. The prefetch wait field sums worker elapsed time without implying a stall in inference. CRC CPU time excludes time when the worker is descheduled. `LLAMA_MOE_CACHE_TRACE` also records routed expert IDs and physical slot sizes. The tuning script simulates the shared cache policy.
 

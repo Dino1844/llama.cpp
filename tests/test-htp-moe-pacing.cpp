@@ -52,7 +52,29 @@ static void test_early_release() {
     std::filesystem::remove(path);
 }
 
+static void test_pause_without_protection() {
+    const auto path = std::filesystem::temp_directory_path() /
+            ("ggml-htp-moe-pause-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    GGML_ASSERT(std::filesystem::create_directory(path));
+    const auto snapshot = path / "phase";
+    GGML_ASSERT(htp_moe_pacer("").pause() == 0);
+    GGML_ASSERT(htp_moe_pacer(snapshot.string().c_str()).pause() == 0);
+
+    for (const char * value : { "1 100 10 4 12 2\n", "1 100 10 4 12 999999999999999999999\n",
+                               "1 100 10 4 12 999999999999999 trailing\n" }) {
+        std::ofstream file(snapshot);
+        file << value;
+        file.close();
+        GGML_ASSERT(file.good());
+        GGML_ASSERT(htp_moe_pacer(snapshot.string().c_str()).pause() == 0);
+    }
+
+    std::filesystem::remove(snapshot);
+    std::filesystem::remove(path);
+}
+
 int main() {
     test_protection();
     test_early_release();
+    test_pause_without_protection();
 }

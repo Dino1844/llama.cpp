@@ -25,6 +25,9 @@ MANAGED_ENV_NAMES = (
     "GGML_HEXAGON_OPBATCH",
     "GGML_HEXAGON_OPQUEUE",
     "GGML_HEXAGON_OPPOLL",
+    "GGML_HEXAGON_Q3K_COMPACT",
+    "GGML_HEXAGON_MOE_HMX_PIPELINE",
+    "GGML_HEXAGON_MOE_HMX_MIN_ROWS",
     "GGML_HEXAGON_MOE_PACING_FILE",
     "GGML_HEXAGON_OPFILTER",
     "GGML_HEXAGON_OPFUSION",
@@ -56,6 +59,8 @@ MANAGED_ENV_NAMES = (
     "LLAMA_MOE_CACHE_PACKED_DIR",
     "LLAMA_MOE_CACHE_PREFETCH",
     "LLAMA_MOE_CACHE_LAYOUT",
+    "LLAMA_MOE_CACHE_IO_THREADS",
+    "LLAMA_MOE_CACHE_READY",
     "LLAMA_MOE_CACHE_OVERLAP",
     "MTMD_BACKEND_DEVICE",
     "D",
@@ -206,14 +211,19 @@ def main():
     parser.add_argument("--sched-debug", action="store_true", help="Enable GGML/llama.cpp scheduler debug output (GGML_SCHED_DEBUG=2)")
     parser.add_argument("--mtmd-device", help="Specify the backend device ID for Multi-Threaded Multi-Device setup (MTMD_BACKEND_DEVICE)")
     parser.add_argument("--no-embd-offload", action="store_true", help="Keep token embeddings and output projection on CPU (-ot token_embd.weight=CPU,output.weight=CPU)")
-    parser.add_argument("--moe-cache-packed-dir", help="Packed Hexagon MoE experts directory on the execution target (LLAMA_MOE_CACHE_PACKED_DIR)")
+    parser.add_argument("--moe-cache-packed-dir", default=os.environ.get("LLAMA_MOE_CACHE_PACKED_DIR"), help="Packed Hexagon MoE experts directory on the execution target (LLAMA_MOE_CACHE_PACKED_DIR)")
     parser.add_argument("--moe-cache-prefetch", type=int, choices=range(9), default=os.environ.get("LLAMA_MOE_CACHE_PREFETCH"), help="Expert prefetch depth (LLAMA_MOE_CACHE_PREFETCH)")
     parser.add_argument("--moe-cache-layout", choices=("shared", "window"), default=os.environ.get("LLAMA_MOE_CACHE_LAYOUT"), help="Expert cache slot layout (LLAMA_MOE_CACHE_LAYOUT)")
+    parser.add_argument("--moe-cache-io-threads", type=int, default=os.environ.get("LLAMA_MOE_CACHE_IO_THREADS"), help="Expert I/O threads, 1-64 (LLAMA_MOE_CACHE_IO_THREADS)")
+    parser.add_argument("--moe-cache-ready", type=int, choices=(0, 1), default=os.environ.get("LLAMA_MOE_CACHE_READY"), help="Let eligible packed expert batches run as slots become ready (LLAMA_MOE_CACHE_READY)")
     parser.add_argument("--moe-cache-overlap", type=int, choices=(0, 1), default=os.environ.get("LLAMA_MOE_CACHE_OVERLAP"), help="Overlap one missing expert with resident Hexagon experts (LLAMA_MOE_CACHE_OVERLAP)")
 
     # Hexagon specific parameters
     parser.add_argument("--hex-verbose", help="Enable verbose logging (GGML_HEXAGON_VERBOSE)")
     parser.add_argument("--hex-profile", help="Enable NPU/Hexagon profiling and performance metrics print (GGML_HEXAGON_PROFILE)")
+    parser.add_argument("--hex-q3k-compact", type=int, choices=(0, 1), default=os.environ.get("GGML_HEXAGON_Q3K_COMPACT"), help="Use compact Q3_K expert banks (GGML_HEXAGON_Q3K_COMPACT)")
+    parser.add_argument("--hex-moe-hmx-pipeline", type=int, choices=(0, 1), default=os.environ.get("GGML_HEXAGON_MOE_HMX_PIPELINE"), help="Enable the routed HMX pipeline (GGML_HEXAGON_MOE_HMX_PIPELINE)")
+    parser.add_argument("--hex-moe-hmx-min-rows", type=int, default=os.environ.get("GGML_HEXAGON_MOE_HMX_MIN_ROWS"), help="Minimum token rows for routed HMX, at least 5 (GGML_HEXAGON_MOE_HMX_MIN_ROWS)")
     parser.add_argument("--hex-moe-pacing-file", default=os.environ.get("GGML_HEXAGON_MOE_PACING_FILE"), help="MoE pacing snapshot path on the execution target (GGML_HEXAGON_MOE_PACING_FILE)")
     parser.add_argument("--hex-nhvx", help="Number of HVX units to use (GGML_HEXAGON_NHVX)")
     parser.add_argument("--hex-nhmx", help="Number of HMX units to use. 0 disables HMX power-up (GGML_HEXAGON_NHMX)")
@@ -253,6 +263,10 @@ def main():
     parser.add_argument("--cl-adreno-large-buffer", action="store_true", help="Allow allocating larger buffer sizes on Adreno GPUs (GGML_OPENCL_ADRENO_USE_LARGE_BUFFER)")
 
     args = parser.parse_args(run_args)
+    if args.moe_cache_io_threads is not None and not 1 <= args.moe_cache_io_threads <= 64:
+        parser.error("--moe-cache-io-threads must be in [1, 64]")
+    if args.hex_moe_hmx_min_rows is not None and not 5 <= args.hex_moe_hmx_min_rows <= 2147483647:
+        parser.error("--hex-moe-hmx-min-rows must be in [5, 2147483647]")
 
     if not cmd_args:
         parser.print_help()
@@ -400,7 +414,12 @@ def main():
     set_env("LLAMA_MOE_CACHE_PACKED_DIR", args.moe_cache_packed_dir)
     set_env("LLAMA_MOE_CACHE_PREFETCH", args.moe_cache_prefetch)
     set_env("LLAMA_MOE_CACHE_LAYOUT", args.moe_cache_layout)
+    set_env("LLAMA_MOE_CACHE_IO_THREADS", args.moe_cache_io_threads)
+    set_env("LLAMA_MOE_CACHE_READY", args.moe_cache_ready)
     set_env("LLAMA_MOE_CACHE_OVERLAP", args.moe_cache_overlap)
+    set_env("GGML_HEXAGON_Q3K_COMPACT", args.hex_q3k_compact)
+    set_env("GGML_HEXAGON_MOE_HMX_PIPELINE", args.hex_moe_hmx_pipeline)
+    set_env("GGML_HEXAGON_MOE_HMX_MIN_ROWS", args.hex_moe_hmx_min_rows)
     set_env("GGML_HEXAGON_MOE_PACING_FILE", args.hex_moe_pacing_file)
 
     # OpenCL environment variables

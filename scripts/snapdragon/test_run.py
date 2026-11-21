@@ -40,21 +40,28 @@ class MoeCacheConfigurationTests(unittest.TestCase):
 
     def test_environment_reaches_each_transport(self):
         env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "window",
-               "LLAMA_MOE_CACHE_OVERLAP": "1", "GGML_HEXAGON_MOE_PACING_FILE": "/tmp/phase snapshot"}
+               "LLAMA_MOE_CACHE_OVERLAP": "1", "LLAMA_MOE_CACHE_READY": "1",
+               "LLAMA_MOE_CACHE_IO_THREADS": "8", "LLAMA_MOE_CACHE_PACKED_DIR": "/tmp/expert pack",
+               "GGML_HEXAGON_Q3K_COMPACT": "1", "GGML_HEXAGON_MOE_HMX_PIPELINE": "1",
+               "GGML_HEXAGON_MOE_HMX_MIN_ROWS": "9", "GGML_HEXAGON_MOE_PACING_FILE": "/tmp/phase snapshot"}
         for target in (None, "android:test-phone", "linux:test-host"):
             with self.subTest(target=target):
                 child = self.run_launcher(target, env=env)
                 self.assertEqual({name: child.get(name) for name in env}, env)
 
     def test_cli_overrides_environment_and_preserves_zero_depth(self):
-        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "shared", "LLAMA_MOE_CACHE_OVERLAP": "1"}
-        options = ["--moe-cache-prefetch", "0", "--moe-cache-layout", "window", "--moe-cache-overlap", "0"]
+        env = {"LLAMA_MOE_CACHE_PREFETCH": "8", "LLAMA_MOE_CACHE_LAYOUT": "shared", "LLAMA_MOE_CACHE_OVERLAP": "1",
+               "LLAMA_MOE_CACHE_READY": "0", "GGML_HEXAGON_MOE_HMX_MIN_ROWS": "5"}
+        options = ["--moe-cache-prefetch", "0", "--moe-cache-layout", "window", "--moe-cache-overlap", "0",
+                   "--moe-cache-ready", "1", "--hex-moe-hmx-min-rows", "9"]
         for target in (None, "android:test-phone", "linux:test-host"):
             with self.subTest(target=target):
                 child = self.run_launcher(target, options, env)
                 self.assertEqual(child.get("LLAMA_MOE_CACHE_PREFETCH"), "0")
                 self.assertEqual(child.get("LLAMA_MOE_CACHE_LAYOUT"), "window")
                 self.assertEqual(child.get("LLAMA_MOE_CACHE_OVERLAP"), "0")
+                self.assertEqual(child.get("LLAMA_MOE_CACHE_READY"), "1")
+                self.assertEqual(child.get("GGML_HEXAGON_MOE_HMX_MIN_ROWS"), "9")
 
     def test_omitted_configuration_stays_unspecified(self):
         for target in (None, "android:test-phone", "linux:test-host"):
@@ -62,10 +69,15 @@ class MoeCacheConfigurationTests(unittest.TestCase):
                 child = self.run_launcher(target)
                 self.assertNotIn("LLAMA_MOE_CACHE_PREFETCH", child)
                 self.assertNotIn("LLAMA_MOE_CACHE_LAYOUT", child)
+                self.assertNotIn("LLAMA_MOE_CACHE_READY", child)
+                self.assertNotIn("GGML_HEXAGON_MOE_HMX_MIN_ROWS", child)
 
     def test_invalid_cli_configuration_is_rejected_before_launch(self):
         for option in (["--moe-cache-prefetch", "-1"], ["--moe-cache-prefetch", "9"],
-                       ["--moe-cache-prefetch", "bad"], ["--moe-cache-layout", "bad"]):
+                       ["--moe-cache-prefetch", "bad"], ["--moe-cache-layout", "bad"],
+                       ["--moe-cache-io-threads", "0"], ["--moe-cache-io-threads", "65"],
+                       ["--moe-cache-ready", "2"], ["--hex-moe-hmx-min-rows", "4"],
+                       ["--hex-moe-hmx-min-rows", "2147483648"]):
             with self.subTest(option=option):
                 self.run_launcher(None, option, expected_exit=2)
 

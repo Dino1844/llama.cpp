@@ -22,6 +22,7 @@ extern size_t opt_mbuf_total;
 
 extern int    opt_mm_select;
 extern bool   opt_moe_hmx_pipeline;
+extern int    opt_moe_hmx_min_rows;
 extern int    opt_fa_select;
 extern int    opt_fa_split;
 extern int    opt_li_select;

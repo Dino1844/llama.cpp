@@ -659,7 +659,7 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    if (m <= HTP_MM_HMX_MIN_NROWS || (is_matmul_id && m < opt_moe_hmx_min_rows)) {
         return false;
     }
 
