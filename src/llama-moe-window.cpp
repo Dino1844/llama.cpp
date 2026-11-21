@@ -239,6 +239,7 @@ struct llama_moe_window::impl {
     std::vector<task> queue;
     std::vector<std::thread> workers;
     bool stopping = false;
+    bool demand_active = false;
     llama_moe_window_stats totals;
 
     std::vector<llama_moe_window_fill> owned;
@@ -303,7 +304,7 @@ struct llama_moe_window::impl {
     void worker() {
         std::unique_lock<std::mutex> lock(mutex);
         for (;;) {
-            work_ready.wait(lock, [&] { return stopping || !queue.empty(); });
+            work_ready.wait(lock, [&] { return stopping || (!demand_active && !queue.empty()); });
             if (stopping) {
                 return;
             }
@@ -475,18 +476,25 @@ struct llama_moe_window::impl {
             return;
         }
         totals.demand += owned.size();
+        // Let in-flight prefetches finish while demand has priority for new reads.
+        demand_active = true;
+        const auto resume_prefetch = [&] {
+            lock.lock();
+            demand_active = false;
+            work_ready.notify_all();
+        };
         lock.unlock();
         try {
             load(il, owned);
         } catch (...) {
-            lock.lock();
+            resume_prefetch();
             for (const auto & f : owned) {
                 layer.complete(f, false);
             }
             owned.clear();
             throw;
         }
-        lock.lock();
+        resume_prefetch();
         for (const auto & f : owned) {
             layer.complete(f, true);
         }

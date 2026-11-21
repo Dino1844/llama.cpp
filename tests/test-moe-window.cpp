@@ -172,6 +172,38 @@ static void test_prefetch_failure(testing & t) {
     t.assert_equal("failed layer queues no further prefetch", before.far_queued, window.stats().far_queued);
 }
 
+static void test_demand_failure_resumes_prefetch(testing & t) {
+    prefetch_gate active, queued;
+    queued.open();
+    llama_moe_window window(std::vector<llama_moe_window_layer>(3, {32, 16}), 4, 1,
+        [&](int32_t il, llama_moe_window_fill fill) {
+            auto & gate = fill.expert == 1 ? active : queued;
+            gate.load(il, fill);
+        },
+        [&](int32_t il, const auto &) {
+            if (il == 1) {
+                active.open();
+                throw std::runtime_error("demand read failed");
+            }
+        });
+    prefetch_gate_release release{active};
+
+    window.begin_batch();
+    int32_t id = 0, slot = -1;
+    window.resolve(0, &id, 1, &slot, {}, {1, 2});
+    if (!t.assert_true("first prefetch started", active.wait_started())) {
+        return;
+    }
+    bool failed = false;
+    try {
+        window.resolve(1, &id, 1, &slot, {}, {});
+    } catch (const std::runtime_error &) {
+        failed = true;
+    }
+    t.assert_true("report the demand failure", failed);
+    t.assert_true("queued prefetch resumes after failed demand", queued.wait_started());
+}
+
 static void test_deferred_completion(testing & t) {
     std::array<int32_t, 2> weights = {-1, -1};
     auto load = [&](int32_t, const auto & fills) {
@@ -285,6 +317,7 @@ int main() {
     t.test("terminal_budget", test_terminal_budget);
     t.test("disable_prefetch", test_disable_prefetch);
     t.test("prefetch_failure", test_prefetch_failure);
+    t.test("demand_failure_resumes_prefetch", test_demand_failure_resumes_prefetch);
     t.test("deferred_completion", test_deferred_completion);
     t.test("deferred_decline", test_deferred_decline);
     t.test("deferred_cleanup", test_deferred_cleanup);
