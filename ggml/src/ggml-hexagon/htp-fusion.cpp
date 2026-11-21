@@ -128,7 +128,7 @@ static bool fuse_allreduce_add(const ggml_hexagon_session * sess, htp_opnode & p
 }
 
 static bool fuse_rms_norm_mul(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
-    if (prev.opcode != HTP_OP_RMS_NORM) return false;
+    if (prev.opcode != HTP_OP_RMS_NORM || prev.params[1] != 0) return false;
 
     const ggml_tensor * weight = nullptr;
     if (!htp_match_consumer(prev, cur, /*commutative=*/ true, &weight)) return false;
@@ -191,18 +191,14 @@ static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & 
     if (src0->type != GGML_TYPE_F32 || !htp_same_shape_and_contiguity(prev.dst(), dst)) return false;
     if (htp_inputs_overlap_unsafe(prev, dst)) return false;
 
-    float scale = 0.0f;
-    float bias  = 0.0f;
-    memcpy(&scale, (const float *) cur.params + 0, sizeof(float));
-    memcpy(&bias,  (const float *) cur.params + 1, sizeof(float));
-    if (bias != 0.0f || scale == 0.0f) return false;
+    // The kernel can apply one scale to the rounded norm or norm-mul result.
+    if (cur.params[1] != 0 || prev.params[1] != 0) return false;
 
-    float prev_scale = 0.0f;
-    memcpy(&prev_scale, &prev.params[1], sizeof(float));
-    if (prev_scale != 0.0f) {
-        scale *= prev_scale;
-    }
-    memcpy(&prev.params[1], &scale, sizeof(float));
+    float scale = 0.0f;
+    memcpy(&scale, &cur.params[0], sizeof(float));
+    if (scale == 0.0f) return false;
+
+    prev.params[1] = cur.params[0];
 
     prev.outputs[0] = dst;
     prev.fused.push_back(cur.node);

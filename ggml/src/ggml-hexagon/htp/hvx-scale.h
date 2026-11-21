@@ -68,6 +68,10 @@ static inline void hvx_scale_f32(uint8_t * restrict dst, const uint8_t * restric
     }
 }
 
+static inline HVX_Vector hvx_vec_scale_offset_f32(HVX_Vector value, HVX_Vector scale, HVX_Vector offset) {
+    return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(value, scale), offset));
+}
+
 #define hvx_scale_offset_f32_loop_body(dst_type, src_type, vec_store)                     \
     do {                                                                                  \
         dst_type * restrict vdst = (dst_type *) dst;                                      \
@@ -85,12 +89,12 @@ static inline void hvx_scale_f32(uint8_t * restrict dst, const uint8_t * restric
                                                                                           \
         _Pragma("unroll(4)")                                                              \
         for (; i < nvec; ++i) {                                                           \
-            HVX_Vector v = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(vsrc[i], vs), vo); \
-            vdst[i] = Q6_Vsf_equals_Vqf32(v);                                             \
+            HVX_Vector v = hvx_vec_scale_offset_f32(vsrc[i], vs, vo);                     \
+            vdst[i] = v;                                                                  \
         }                                                                                 \
         if (nloe) {                                                                       \
-            HVX_Vector v = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(vsrc[i], vs), vo); \
-            vec_store((void *) &vdst[i], nloe * elem_size, Q6_Vsf_equals_Vqf32(v));       \
+            HVX_Vector v = hvx_vec_scale_offset_f32(vsrc[i], vs, vo);                     \
+            vec_store((void *) &vdst[i], nloe * elem_size, v);                            \
         }                                                                                 \
     } while(0)
 

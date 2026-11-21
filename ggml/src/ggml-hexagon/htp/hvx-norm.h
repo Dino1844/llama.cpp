@@ -7,6 +7,7 @@
 #include "hvx-inverse.h"
 #include "hvx-sqrt.h"
 #include "hvx-repl.h"
+#include "hvx-scale.h"
 
 static inline void hvx_fast_rms_norm_f32(const uint8_t * restrict src,
                                          uint8_t * restrict dst,
@@ -47,25 +48,26 @@ static inline void hvx_fast_rms_norm_f32(const uint8_t * restrict src,
     HVX_Vector mean_v         = Q6_Vqf32_vmpy_VsfVsf(sum_v, denom_v);
     HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
 
-    // Scale full vectors
-    HVX_Vector scale_v = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
-    if (scale != 0.0f) {
-        scale_v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale_v, hvx_vec_splat_f32(scale)));
-    }
+    // Keep the F32 rounding between normalization and SCALE.
+    const HVX_Vector inv_rms = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
+    const HVX_Vector scale_v = hvx_vec_splat_f32(scale);
+    const HVX_Vector zero = hvx_vec_splat_f32(0.0f);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        v_dst[i] = Q6_Vsf_equals_Vqf32(v2);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
+        const HVX_Vector normalized = Q6_Vsf_equals_Vqf32(v2);
+        v_dst[i] = scale != 0.0f ? hvx_vec_scale_offset_f32(normalized, scale_v, zero) : normalized;
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
-        HVX_Vector result = Q6_Vsf_equals_Vqf32(v2);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
+        const HVX_Vector normalized = Q6_Vsf_equals_Vqf32(v2);
+        const HVX_Vector result = scale != 0.0f ? hvx_vec_scale_offset_f32(normalized, scale_v, zero) : normalized;
 
         // Store with masking to avoid overwriting memory beyond the tensor
         hvx_vec_store_a(&v_dst[nvec], nloe * 4, result);
@@ -113,28 +115,29 @@ static inline void hvx_fast_rms_norm_mul_f32(const uint8_t * restrict src,
     HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
 
     // Scale and multiply
-    HVX_Vector scale_v = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
-    if (scale != 0.0f) {
-        scale_v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale_v, hvx_vec_splat_f32(scale)));
-    }
+    const HVX_Vector inv_rms = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
+    const HVX_Vector scale_v = hvx_vec_splat_f32(scale);
+    const HVX_Vector zero = hvx_vec_splat_f32(0.0f);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
         HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
         HVX_Vector result = Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[i]);
-        v_dst[i] = Q6_Vsf_equals_Vqf32(result);
+        const HVX_Vector weighted = Q6_Vsf_equals_Vqf32(result);
+        v_dst[i] = scale != 0.0f ? hvx_vec_scale_offset_f32(weighted, scale_v, zero) : weighted;
     }
 
     // Handle tail elements using vectorized ops with masking
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
         HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
         HVX_Vector result = Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[nvec]);
-        HVX_Vector res_v = Q6_Vsf_equals_Vqf32(result);
+        const HVX_Vector weighted = Q6_Vsf_equals_Vqf32(result);
+        const HVX_Vector res_v = scale != 0.0f ? hvx_vec_scale_offset_f32(weighted, scale_v, zero) : weighted;
 
         // Store with masking to avoid overwriting memory beyond the tensor
         hvx_vec_store_a(&v_dst[nvec], nloe * 4, res_v);
@@ -180,27 +183,28 @@ static inline void hvx_fast_rms_norm_mul_add_f32(const uint8_t * restrict src,
     HVX_Vector mean_v         = Q6_Vqf32_vmpy_VsfVsf(sum_v, denom_v);
     HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
 
-    HVX_Vector scale_v = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
-    if (scale != 0.0f) {
-        scale_v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(scale_v, hvx_vec_splat_f32(scale)));
-    }
+    const HVX_Vector inv_rms = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(mean_epsilon_v));
+    const HVX_Vector scale_v = hvx_vec_splat_f32(scale);
+    const HVX_Vector zero = hvx_vec_splat_f32(0.0f);
 
     #pragma unroll(4)
     for (int i = 0; i < nvec; i++) {
         HVX_Vector v1 = v_src[i];
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
         HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
         HVX_Vector v4 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[i]));
-        v_dst[i] = hvx_vec_add_f32_f32(v4, v_add[i]);
+        const HVX_Vector weighted = scale != 0.0f ? hvx_vec_scale_offset_f32(v4, scale_v, zero) : v4;
+        v_dst[i] = hvx_vec_add_f32_f32(weighted, v_add[i]);
     }
 
     if (nloe > 0) {
         HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
         HVX_Vector v1 = Q6_V_vand_QV(bmask, v_src[nvec]);
-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, scale_v);
+        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, inv_rms);
         HVX_Vector v3 = Q6_Vsf_equals_Vqf32(v2);
         HVX_Vector v4 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v3, v_weight[nvec]));
-        HVX_Vector res_v = hvx_vec_add_f32_f32(v4, v_add[nvec]);
+        const HVX_Vector weighted = scale != 0.0f ? hvx_vec_scale_offset_f32(v4, scale_v, zero) : v4;
+        const HVX_Vector res_v = hvx_vec_add_f32_f32(weighted, v_add[nvec]);
 
         hvx_vec_store_a(&v_dst[nvec], nloe * 4, res_v);
     }
